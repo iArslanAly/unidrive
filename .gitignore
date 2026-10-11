@@ -1,0 +1,29 @@
+# Dependencies & builds
+node_modules/
+dist/
+build/
+
+# Environment & sensitive keys
+.env
+.env.local
+.env.*.local
+backend/.env
+backend/.env.local
+backend/.env.*.local
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+*.pem
+*.key
+
+# SQLite database files
+*.db
+*.db-journal
+*.sqlite
+dev.db
+dev.db-journal
+
+# Logs & OS junk
+*.log
+.DS_Store
+Thumbs.db
