@@ -2,6 +2,7 @@ export type FolderItem = {
   id?: string
   name: string
   updated: string
+  itemCount?: number
   color: string
   iconUrl?: string | null
   parentId?: string | null
@@ -20,6 +21,10 @@ export type FileItem = {
   accountProvider?: string
   createdAt?: string
   kind: 'doc' | 'image' | 'video' | 'pdf'
+  /** Native Google Drive thumbnailLink (fast CDN path) when available. */
+  thumbnailUrl?: string | null
+  /** Google Drive provider file id — enables the native /preview embed fast-path. */
+  providerFileId?: string | null
   shared: number
   owner?: string
   location?: string
@@ -28,6 +33,10 @@ export type FileItem = {
   openedDate?: string
   folderId?: string | null
   folderName?: string | null
+  /** Video/audio duration in seconds — powers the media-card duration pill when present. */
+  durationSeconds?: number
+  /** PDF page count — powers the media-card page-count pill when present. */
+  pageCount?: number
 }
 
 export const folders: FolderItem[] = [

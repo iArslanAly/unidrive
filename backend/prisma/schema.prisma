@@ -58,8 +58,18 @@ model ApiKey {
 model UploadRoutingPolicy {
   id                 String   @id @default(uuid())
   userId             String   @unique @map("user_id")
-  mode               String   @default("most_available")
+  /// Allocation strategy: 'auto' (Smart Auto), 'priority' (Priority Waterfall),
+  /// 'rules' (Rule-Based). Legacy rows may hold 'most_available' / 'round_robin'
+  /// and are normalized to 'auto' on read/write.
+  mode               String   @default("auto")
+  /// Ordered providerAccountIds used by Priority Waterfall.
   priorityAccountIds Json     @map("priority_account_ids")
+  /// Per-drive quota guard (percent). Uploads avoid drives at/above this usage;
+  /// falls back to the emptiest drive when every drive is capped.
+  safetyCapPercent   Int      @default(85) @map("safety_cap_percent")
+  /// Rule-Based routing map: MIME kind -> providerAccountId ({ video?, document?, default? }).
+  typeRules          Json?    @map("type_rules")
+  /// Legacy round-robin cursor; retained for old rows, unused by current modes.
   roundRobinCursor   Int      @default(0) @map("round_robin_cursor")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
@@ -216,6 +226,7 @@ model File {
   name               String          
   mimeType           String           @map("mime_type")
   sizeBytes          BigInt           @map("size_bytes")
+  thumbnailUrl       String?          @map("thumbnail_url")
   checksum           String?         
   status             String           @default("active")
   createdAt          DateTime         @default(now()) @map("created_at")

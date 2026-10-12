@@ -151,6 +151,7 @@ type DriveFileMetadata = {
   mimeType: string
   sizeBytes: bigint
   parentId: string
+  thumbnailUrl?: string | null
 }
 
 export async function syncGoogleAppFolderFiles(accountId: string, userId: string): Promise<GoogleAppFolderSyncResult> {
@@ -178,14 +179,14 @@ export async function syncGoogleAppFolderFiles(accountId: string, userId: string
     const response = await drive.files.list({
       q,
       spaces: 'drive',
-      fields: 'nextPageToken,files(id,name,mimeType,size,parents)',
+      fields: 'nextPageToken,files(id,name,mimeType,size,parents,thumbnailLink)',
       pageSize: 1000,
       pageToken,
     })
     for (const file of response.data.files ?? []) {
       if (!file.id || !file.name || !file.mimeType) continue
       const parentId = file.parents?.[0] ?? appFolderId
-      driveFiles.push({ id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: BigInt(file.size ?? 0), parentId })
+      driveFiles.push({ id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: BigInt(file.size ?? 0), parentId, thumbnailUrl: file.thumbnailLink ?? null })
     }
     pageToken = response.data.nextPageToken ?? undefined
   } while (pageToken)
@@ -206,17 +207,17 @@ export async function syncGoogleAppFolderFiles(accountId: string, userId: string
     const existing = existingByProviderId.get(driveFile.id)
     if (!existing) {
       await prisma.file.create({
-        data: { userId, connectedAccountId: account.id, provider: 'google_drive', providerFileId: driveFile.id, name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, status: 'active', folderId: dbFolderId },
+        data: { userId, connectedAccountId: account.id, provider: 'google_drive', providerFileId: driveFile.id, name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, thumbnailUrl: driveFile.thumbnailUrl ?? null, status: 'active', folderId: dbFolderId },
       })
       created += 1
       continue
     }
 
-    const needsUpdate = existing.name !== driveFile.name || existing.mimeType !== driveFile.mimeType || existing.sizeBytes !== driveFile.sizeBytes || existing.status !== 'active' || existing.deletedAt !== null || existing.folderId !== dbFolderId
+    const needsUpdate = existing.name !== driveFile.name || existing.mimeType !== driveFile.mimeType || existing.sizeBytes !== driveFile.sizeBytes || existing.status !== 'active' || existing.deletedAt !== null || existing.folderId !== dbFolderId || (driveFile.thumbnailUrl && existing.thumbnailUrl !== driveFile.thumbnailUrl)
     if (needsUpdate) {
       await prisma.file.update({
         where: { id: existing.id },
-        data: { name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, status: 'active', deletedAt: null, folderId: dbFolderId },
+        data: { name: driveFile.name, mimeType: driveFile.mimeType, sizeBytes: driveFile.sizeBytes, thumbnailUrl: driveFile.thumbnailUrl ?? existing.thumbnailUrl, status: 'active', deletedAt: null, folderId: dbFolderId },
       })
       updated += 1
     }

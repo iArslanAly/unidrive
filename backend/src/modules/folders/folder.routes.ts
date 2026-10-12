@@ -21,8 +21,13 @@ const createSchema = z.object({
   parentId: z.string().nullable().optional(),
 })
 
-function serializeFolder(folder: { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; createdAt: Date; updatedAt: Date }) {
-  return { ...folder, providerFolderId: folder.providerFolderId ?? null, createdAt: folder.createdAt.toISOString(), updatedAt: folder.updatedAt.toISOString() }
+function serializeFolder(folder: { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; createdAt: Date; updatedAt: Date; _count?: { files: number; children: number } }) {
+  const { _count, ...rest } = folder
+  // Always emit valid ISO strings. A null/undefined Date would serialize to
+  // `null`, which the frontend Intl formatter then turns into an invalid Date and
+  // throws "RangeError: date value is not finite". Fall back to now().
+  const nowIso = new Date().toISOString()
+  return { ...rest, providerFolderId: folder.providerFolderId ?? null, createdAt: folder.createdAt ? folder.createdAt.toISOString() : nowIso, updatedAt: folder.updatedAt ? folder.updatedAt.toISOString() : nowIso, itemCount: (_count?.files ?? 0) + (_count?.children ?? 0) }
 }
 
 async function ensureProviderFolderIds(
@@ -85,10 +90,13 @@ folderRouter.get('/', async (req: AuthRequest, res, next) => {
     const query = z.object({ parentId: z.string().nullable().optional(), all: z.string().optional() }).parse(req.query)
     const folders = await prisma.folder.findMany({
       where: { userId: req.user!.id, deletedAt: null, ...(query.all === '1' ? {} : { parentId: query.parentId ?? null }) },
-      select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
+      select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true, _count: { select: { files: true, children: true } } },
       orderBy: { updatedAt: 'desc' },
     })
-    await ensureProviderFolderIds(folders, req.user!.id)
+    // Self-heal any folders missing a Google Drive id in the BACKGROUND — never
+    // block navigation on a Drive API call. GET /folders must serve strictly
+    // from the local database so folder clicks stay instant.
+    void ensureProviderFolderIds(folders, req.user!.id).catch((error) => console.error('Background folder self-heal failed:', error))
     return res.json({ folders: folders.map(serializeFolder) })
   } catch (error) {
     return next(error)
@@ -104,7 +112,7 @@ folderRouter.get('/recent', async (req: AuthRequest, res, next) => {
       orderBy: { updatedAt: 'desc' },
       take: limit,
     })
-    await ensureProviderFolderIds(folders, req.user!.id)
+    void ensureProviderFolderIds(folders, req.user!.id).catch((error) => console.error('Background folder self-heal failed:', error))
     return res.json({ folders: folders.map(serializeFolder) })
   } catch (error) {
     return next(error)

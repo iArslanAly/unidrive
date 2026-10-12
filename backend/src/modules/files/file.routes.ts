@@ -58,7 +58,12 @@ fileRouter.get('/', async (req: AuthRequest, res, next) => {
     const where: any = {
       userId: req.user!.id,
       status: 'active',
-      ...(query.folderId ? { folderId: query.folderId } : {}),
+      // Strict folder scoping: the literal value "folderId=null" selects only
+      // root files (folder_id IS NULL); an id selects that folder's rows;
+      // omitting the parameter keeps legacy all-files behavior.
+      ...(query.folderId !== undefined
+        ? { folderId: query.folderId === 'null' || query.folderId === '' ? null : query.folderId }
+        : {}),
       ...(query.q ? { name: { contains: query.q } } : {}),
       ...(query.accountId ? { connectedAccountId: query.accountId } : {}),
       ...(query.kind ? { mimeType: { in: typeFilters[query.kind] || [] } } : {}),
@@ -381,6 +386,43 @@ fileRouter.get('/:id/download', async (req: AuthRequest, res, next) => {
     const fileId = String(req.params.id)
     const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id }, include: { connectedAccount: true } })
     return streamProviderFile(file, req.headers.range, res, { disposition: 'attachment' })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+fileRouter.put('/:id/content', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const fileId = String(req.params.id)
+    const file = await prisma.file.findFirst({ where: { id: fileId, userId: req.user!.id, status: 'active', deletedAt: null }, include: { connectedAccount: true } })
+    if (!file) return res.status(404).json({ code: 'FILE_NOT_FOUND', message: 'File not found.' })
+    if (file.provider !== 'google_drive' || !file.connectedAccount) {
+      return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'Only Google Drive files support in-place content updates.' })
+    }
+
+    // Collect the raw binary body (application/pdf). express.json/urlencoded skip
+    // non-JSON content types, so `req` is still an intact readable stream here.
+    const chunks: Buffer[] = []
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array))
+    }
+    const buffer = Buffer.concat(chunks)
+    if (buffer.length === 0) return res.status(400).json({ code: 'EMPTY_BODY', message: 'No file content provided.' })
+
+    const auth = await getAuthedGoogleClient(file.connectedAccount)
+    const drive = google.drive({ version: 'v3', auth })
+    await drive.files.update({
+      fileId: file.providerFileId,
+      media: { mimeType: 'application/pdf', body: Readable.from(buffer) },
+      fields: 'id',
+    })
+
+    const updated = await prisma.file.update({
+      where: { id: file.id },
+      data: { sizeBytes: BigInt(buffer.length), updatedAt: new Date() },
+    })
+    await createAuditLog(req.user!.id, 'UPDATE_FILE_CONTENT', 'file', file.id, { name: file.name, sizeBytes: buffer.length })
+    return res.json({ status: 'ok', file: { ...updated, sizeBytes: updated.sizeBytes.toString() } })
   } catch (error) {
     return next(error)
   }

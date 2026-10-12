@@ -42,54 +42,54 @@ export function FileTable({ files, mode = 'default', selectedFileIds = new Set<s
         })}
       </div>
 
-      {/* Desktop table view */}
-      <div className="hidden overflow-x-auto sm:block">
-        <table className="w-full min-w-[760px] border-collapse text-left text-sm">
+      {/* Desktop table view — Linear-style high-density table */}
+      <div className="hidden overflow-hidden rounded-2xl border border-zinc-200/90 bg-white shadow-sm dark:border-white/[0.06] dark:bg-zinc-900/40 sm:block">
+        <table className="w-full min-w-[820px] border-collapse text-left text-sm">
           <thead>
-            <tr className="border-b border-slate-200/20 text-slate-950">
-              <th className="w-9 py-2.5"><input type="checkbox" className="h-4 w-4 accent-blue-600" checked={allSelected} onChange={onToggleAll} /></th>
-              <th className="py-2.5 font-extrabold">Name</th>
-              {mode === 'default' ? <th className="py-2.5 font-extrabold text-slate-500 font-semibold">Folder</th> : null}
-              {mode === 'shared' ? <th className="py-2.5 font-extrabold">Owner</th> : null}
-              {mode === 'recent' ? <th className="py-2.5 font-extrabold">Last Opened</th> : null}
-              {mode === 'starred' ? <th className="py-2.5 font-extrabold">Starred On</th> : null}
-              {mode === 'archived' ? <th className="py-2.5 font-extrabold">Archived Date</th> : null}
-              {mode === 'archived' ? <th className="py-2.5 font-extrabold">Original Location</th> : <th className="py-2.5 font-extrabold">Last Modified</th>}
-              <th className="py-2.5 font-extrabold">Size</th>
-              <th className="py-2.5 font-extrabold">Access</th>
-              <th className="py-2.5" />
+            <tr className="border-b border-zinc-200 text-xs uppercase tracking-wide text-zinc-500 dark:border-zinc-800/80 dark:text-zinc-500">
+              <th className="px-4 py-3"><input type="checkbox" className="h-4 w-4 accent-blue-600" checked={allSelected} onChange={onToggleAll} /></th>
+              <th className="px-4 py-3 font-semibold">Name</th>
+              {mode === 'default' ? <th className="px-4 py-3 font-semibold">Folder</th> : null}
+              {mode === 'shared' ? <th className="px-4 py-3 font-semibold">Owner</th> : null}
+              {mode === 'recent' ? <th className="px-4 py-3 font-semibold">Last Opened</th> : null}
+              {mode === 'starred' ? <th className="px-4 py-3 font-semibold">Starred On</th> : null}
+              {mode === 'archived' ? <th className="px-4 py-3 font-semibold">Archived Date</th> : null}
+              {mode === 'archived' ? <th className="px-4 py-3 font-semibold">Original Location</th> : <th className="px-4 py-3 font-semibold">Last Modified</th>}
+              <th className="px-4 py-3 font-semibold">Size</th>
+              <th className="px-4 py-3 font-semibold">Drive / Account</th>
+              <th className="px-4 py-3" />
             </tr>
           </thead>
           <tbody>
             {files.map((file) => (
-              <tr key={file.id ?? file.name} draggable onDragStart={(event) => { event.dataTransfer.setData('text/plain', file.id ?? ''); event.dataTransfer.effectAllowed = 'move' }} onContextMenu={(event) => onFileContextMenu?.(event, file)} onClick={() => onToggleFile?.(file)} onDoubleClick={() => onFileOpen?.(file)} className={selectedFileIds.has(file.id ?? '') ? 'group border-b file-selected transition hover:bg-orange-500/15 cursor-grab active:cursor-grabbing' : 'group border-b border-slate-200/10 transition hover:bg-slate-100 cursor-grab active:cursor-grabbing'}>
-                <td className="py-2.5"><input type="checkbox" className="h-4 w-4 accent-blue-600" checked={selectedFileIds.has(file.id ?? '')} onChange={() => onToggleFile?.(file)} onClick={(event) => event.stopPropagation()} /></td>
-                <td className="py-2.5 font-semibold">
+              <tr key={file.id ?? file.name} draggable onDragStart={(event) => { event.dataTransfer.setData('text/plain', file.id ?? ''); event.dataTransfer.effectAllowed = 'move' }} onContextMenu={(event) => onFileContextMenu?.(event, file)} onClick={() => onToggleFile?.(file)} onDoubleClick={() => onFileOpen?.(file)} className={selectedFileIds.has(file.id ?? '') ? 'group border-b border-zinc-200/50 file-selected transition-colors hover:bg-zinc-100 dark:border-zinc-800/50 dark:hover:bg-zinc-900/60 cursor-grab active:cursor-grabbing' : 'group border-b border-zinc-200/50 transition-colors hover:bg-zinc-100 dark:border-zinc-800/50 dark:hover:bg-zinc-900/60 cursor-grab active:cursor-grabbing'}>
+                <td className="px-4 py-3"><input type="checkbox" className="h-4 w-4 accent-blue-600" checked={selectedFileIds.has(file.id ?? '')} onChange={() => onToggleFile?.(file)} onClick={(event) => event.stopPropagation()} /></td>
+                <td className="px-4 py-3 font-semibold">
                   <span className="flex min-w-0 items-center gap-2.5">
                     {mode === 'starred' ? <Star className="h-4 w-4 shrink-0 fill-yellow-400 text-yellow-400" /> : <FileIcon kind={file.kind} />}
-                    <span className="truncate max-w-[200px] lg:max-w-[280px]" title={file.name}>{file.name}</span>
+                    <span className="truncate max-w-[200px] lg:max-w-[320px]" title={file.name}>{file.name}</span>
                   </span>
                 </td>
                 {/* Folder path column — only in default mode */}
                 {mode === 'default' ? (
-                  <td className="py-2.5 text-slate-400">
+                  <td className="px-4 py-3 text-zinc-400">
                     {file.folderName ? (
                       <span className="flex items-center gap-1 text-xs font-medium text-blue-500">
                         <FolderOpen className="h-3.5 w-3.5 shrink-0" />
                         <span className="truncate max-w-[120px]">{file.folderName}</span>
                       </span>
                     ) : (
-                      <span className="text-xs text-slate-300">—</span>
+                      <span className="text-xs text-zinc-400 dark:text-zinc-600">—</span>
                     )}
                   </td>
                 ) : null}
-                {mode === 'shared' ? <td className="py-2.5 text-slate-500">{file.owner}</td> : null}
-                {mode === 'recent' ? <td className="py-2.5 text-slate-500">{file.openedDate}</td> : null}
-                {mode === 'starred' ? <td className="py-2.5 text-slate-500">{file.starredDate}</td> : null}
-                {mode === 'archived' ? <td className="py-2.5 text-slate-500">{file.archivedDate}</td> : null}
-                <td className="py-2.5 text-slate-500">{mode === 'archived' ? file.location : file.date}</td>
-                <td className="py-2.5 text-slate-500">{file.size}</td>
-                <td className="py-2.5 text-slate-500"><span className="flex items-center gap-2"><AvatarStack count={file.shared} />{file.access}</span></td>
+                {mode === 'shared' ? <td className="px-4 py-3 text-zinc-500 dark:text-zinc-400">{file.owner}</td> : null}
+                {mode === 'recent' ? <td className="px-4 py-3 text-zinc-500 dark:text-zinc-400">{file.openedDate}</td> : null}
+                {mode === 'starred' ? <td className="px-4 py-3 text-zinc-500 dark:text-zinc-400">{file.starredDate}</td> : null}
+                {mode === 'archived' ? <td className="px-4 py-3 text-zinc-500 dark:text-zinc-400">{file.archivedDate}</td> : null}
+                <td className="px-4 py-3 text-zinc-500 dark:text-zinc-400">{mode === 'archived' ? file.location : file.date}</td>
+                <td className="px-4 py-3 font-mono text-zinc-500 dark:text-zinc-400">{file.size}</td>
+                <td className="px-4 py-3"><span className="flex items-center gap-2"><AvatarStack count={file.shared} /><span className="truncate max-w-[140px] text-zinc-500 dark:text-zinc-400">{file.access}</span></span></td>
                 <td className="py-2.5 text-right">
                   <div className="flex items-center justify-end gap-1.5">
                     {/* Hover shortcuts */}

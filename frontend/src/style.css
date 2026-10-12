@@ -2,6 +2,14 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Horizontal control rows scroll cleanly on mobile without visible scrollbars. */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 :root, :root.light {
   --bg-gradient:
     radial-gradient(at 0% 0%, rgba(224, 231, 255, 0.45) 0px, transparent 50%),

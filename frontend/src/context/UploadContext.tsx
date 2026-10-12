@@ -14,6 +14,13 @@ export type UploadProgressFile = {
   chunkTotal?: number
   /** Chunk visualizer: storage provider/email the current part is targeting. */
   provider?: string
+  /** Bytes flushed from the browser so far (real-time, from xhr.upload.onprogress). */
+  loadedBytes?: number
+  /**
+   * Upload phase for the live drawer. 'uploading' = bytes streaming from the
+   * browser; 'saving' = all bytes sent, backend is finalizing on Google Drive.
+   */
+  phase?: 'uploading' | 'saving'
   /** Human-readable failure reason shown in the error badge. */
   errorMessage?: string
 }
@@ -45,7 +52,7 @@ function fileKey(file: { name: string; size: number }) {
 
 /** Matches backend "not enough / no connected account" failures. */
 function isNoDriveError(message: string) {
-  return /no connected storage account|not enough storage|combined connected storage|no storage drive/i.test(message)
+  return /no (?:active |connected )?storage account|not enough storage|combined connected storage|no storage drive/i.test(message)
 }
 
 async function hasNoConnectedAccounts(): Promise<boolean> {
@@ -67,8 +74,14 @@ export function UploadProvider({ children }: { children: ReactNode }) {
   })
   const [resumableSessions, setResumableSessions] = useState<Record<string, ResumableSession>>({})
 
-  async function uploadSingleFileResumable(file: File, folderId: string | null, onProgress: (percent: number, chunk?: { index: number; total: number }, provider?: string) => void, sessionIdToRetry?: string, targetAccountId?: string | null, providerEmailHint?: string) {
-    const CHUNK_SIZE = 5 * 1024 * 1024 // 5MB chunks (must be multiple of 256KB for Google Drive)
+  async function uploadSingleFileResumable(file: File, folderId: string | null, onProgress: (percent: number, chunk?: { index: number; total: number }, provider?: string, loadedBytes?: number, phase?: 'uploading' | 'saving') => void, sessionIdToRetry?: string, targetAccountId?: string | null, providerEmailHint?: string) {
+    // 500 MB parts (multiple of 256 KB as required by Google Drive). Files
+    // smaller than this — e.g. 73 MB — upload as ONE part (Chunk 1 of 1)
+    // instead of 15 × 5 MB parts that spammed the Drive API. Larger files are
+    // split into sequential 500 MB parts against the same resumable session;
+    // cross-account splitting only happens on the backend vault path when no
+    // single account can hold the whole file.
+    const CHUNK_SIZE = 500 * 1024 * 1024
     let sessionId = sessionIdToRetry || ''
     let startOffset = 0
     let providerEmail = providerEmailHint
@@ -103,7 +116,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       const statusData = await apiFetch<{ status: string; offset: string }>(`/uploads/resumable/status/${sessionId}`)
       startOffset = Number(statusData.offset)
       if (statusData.status === 'completed') {
-        onProgress(100, { index: chunkTotal, total: chunkTotal }, providerEmail)
+        onProgress(100, { index: chunkTotal, total: chunkTotal }, providerEmail, file.size, 'saving')
         return
       }
     }
@@ -117,30 +130,84 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       // Surface the active part immediately so the drawer shows "Chunk N of M" while it streams
       onProgress(Math.min(99, Math.round((startOffset / file.size) * 100)), { index: chunkIndex, total: chunkTotal }, providerEmail)
 
-      // We use raw fetch with authorization header for binary stream upload
-      const response = await fetch(`${API_URL}/uploads/resumable/chunk/${sessionId}`, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${getAccessToken()}`,
-          'Content-Range': `bytes ${startOffset}-${endOffset - 1}/${file.size}`,
-          'Content-Length': String(chunk.size)
-        },
-        body: chunk
-      })
-
-      if (!response.ok) {
-        throw new Error('Chunk upload failed')
+      // Raw fetch for the binary stream upload. Network-level failures (backend
+      // restart, dropped socket, CORS preflight rejection, oversized body) must
+      // surface as an actionable message — and the raw cause must be visible in
+      // the console so the friendly drawer text never masks it.
+      const chunkUrl = `${API_URL}/uploads/resumable/chunk/${sessionId}`
+      const contentRangeHeader = `bytes ${startOffset}-${endOffset - 1}/${file.size}`
+      const requestHeaders: Record<string, string> = {
+        'Authorization': `Bearer ${getAccessToken()}`,
+        'Content-Range': contentRangeHeader,
+        'Content-Length': String(chunk.size)
       }
 
-      const resData = await response.json() as { status: string; offset?: string }
+      // XMLHttpRequest (not fetch) so we get true byte-level client→server
+      // progress via xhr.upload.onprogress. fetch only resolves when the whole
+      // request body is flushed, so a single-part file (e.g. 73 MB) would jump
+      // 0% → 100% with no feedback. Network-level failures (backend restart,
+      // dropped socket, CORS preflight rejection) surface as an actionable
+      // message, and the raw cause is logged so the drawer text never masks it.
+      const xhrResult = await new Promise<{ status: number; statusText: string; responseText: string }>((resolve, reject) => {
+        const xhr = new XMLHttpRequest()
+        xhr.open('PUT', chunkUrl)
+        Object.entries(requestHeaders).forEach(([key, value]) => xhr.setRequestHeader(key, value))
+
+        // Real-time byte progress for THIS chunk, mapped onto the whole-file percent.
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            const overallLoaded = startOffset + event.loaded
+            const chunkPercent = event.loaded / event.total
+            const overallPercent = Math.min(99, Math.round(((startOffset + event.loaded) / file.size) * 100))
+            onProgress(overallPercent, { index: chunkIndex, total: chunkTotal }, providerEmail, overallLoaded, 'uploading')
+            // Note: chunkPercent is informational; overallLoaded/overallPercent drive the UI.
+            void chunkPercent
+          }
+        }
+
+        xhr.onload = () => resolve({ status: xhr.status, statusText: xhr.statusText, responseText: xhr.responseText || '' })
+        xhr.onerror = () => {
+          console.error('[Upload Debug] Failed endpoint:', chunkUrl)
+          console.error('[Upload Debug] Request options:', { method: 'PUT', headers: { ...requestHeaders, Authorization: 'Bearer <redacted>' } })
+          console.error('[Upload Debug] Raw error / response: XMLHttpRequest network error (status 0)')
+          console.error('[Upload Debug] Hint: a network error here usually means the CORS preflight was rejected (server must allow the Content-Range header) or the backend is unreachable.')
+          reject(new Error('Connection to backend interrupted or file exceeds upload limit. Press Retry to resume this upload.'))
+        }
+        xhr.ontimeout = () => reject(new Error('Upload timed out. Press Retry to resume this upload.'))
+        xhr.send(chunk)
+      })
+
+      // All bytes for this chunk have left the browser — the backend is now
+      // finalizing on Google Drive. Flip the drawer into the "saving" phase.
+      onProgress(Math.min(99, Math.round((endOffset / file.size) * 100)), { index: chunkIndex, total: chunkTotal }, providerEmail, endOffset, 'saving')
+
+      if (xhrResult.status < 200 || xhrResult.status >= 300) {
+        const rawText = xhrResult.responseText
+        console.error('[Upload Debug] Failed endpoint:', chunkUrl)
+        console.error('[Upload Debug] HTTP status:', xhrResult.status, xhrResult.statusText)
+        console.error('[Upload Debug] Raw error / response:', rawText || '(empty body)')
+        let errorBody: { message?: string; error?: string } | null = null
+        try {
+          errorBody = rawText ? JSON.parse(rawText) : null
+        } catch { /* non-JSON body (e.g. proxy HTML) — fall back to raw text */ }
+        const serverMessage = (errorBody?.message || errorBody?.error || rawText || '').trim()
+        throw new Error(serverMessage || `Chunk upload failed (HTTP ${xhrResult.status}).`)
+      }
+
+      let resData: { status: string; offset?: string }
+      try {
+        resData = JSON.parse(xhrResult.responseText) as { status: string; offset?: string }
+      } catch {
+        resData = { status: 'completed' }
+      }
       if (resData.status === 'completed') {
-        onProgress(100, { index: chunkTotal, total: chunkTotal }, providerEmail)
+        onProgress(100, { index: chunkTotal, total: chunkTotal }, providerEmail, file.size, 'saving')
         break
       }
 
       startOffset = Number(resData.offset)
       const percent = Math.min(99, Math.round((startOffset / file.size) * 100))
-      onProgress(percent, { index: Math.min(chunkTotal, Math.floor(startOffset / CHUNK_SIZE) + 1), total: chunkTotal }, providerEmail)
+      onProgress(percent, { index: Math.min(chunkTotal, Math.floor(startOffset / CHUNK_SIZE) + 1), total: chunkTotal }, providerEmail, startOffset, 'uploading')
     }
   }
 
@@ -174,7 +241,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     for (let i = 0; i < uniqueFiles.length; i++) {
       const file = uniqueFiles[i]
       try {
-        await uploadSingleFileResumable(file, targetFolderId, (filePercent, chunk, provider) => {
+        await uploadSingleFileResumable(file, targetFolderId, (filePercent, chunk, provider, loadedBytes, phase) => {
           setUploadProgress((current) => {
             const nextFiles = [...current.files]
             // Identity lookup (name+size) instead of positional index to avoid mismatches.
@@ -187,6 +254,8 @@ export function UploadProvider({ children }: { children: ReactNode }) {
                 chunkIndex: chunk?.index ?? nextFiles[idx].chunkIndex,
                 chunkTotal: chunk?.total ?? nextFiles[idx].chunkTotal,
                 provider: provider ?? nextFiles[idx].provider,
+                loadedBytes: loadedBytes ?? nextFiles[idx].loadedBytes,
+                phase: phase ?? nextFiles[idx].phase,
               }
             }
             const overallPercent = Math.round(nextFiles.reduce((sum, f) => sum + f.percent, 0) / nextFiles.length)
@@ -243,7 +312,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     })
 
     try {
-      await uploadSingleFileResumable(session.file, session.folderId || null, (filePercent, chunk, provider) => {
+      await uploadSingleFileResumable(session.file, session.folderId || null, (filePercent, chunk, provider, loadedBytes, phase) => {
         setUploadProgress((current) => {
           const nextFiles = [...current.files]
           const idx = nextFiles.findIndex((entry) => entry.name === fileName && entry.size === session.file.size)
@@ -255,6 +324,8 @@ export function UploadProvider({ children }: { children: ReactNode }) {
               chunkIndex: chunk?.index ?? nextFiles[idx].chunkIndex,
               chunkTotal: chunk?.total ?? nextFiles[idx].chunkTotal,
               provider: provider ?? nextFiles[idx].provider,
+                            loadedBytes: loadedBytes ?? nextFiles[idx].loadedBytes,
+                phase: phase ?? nextFiles[idx].phase,
             }
           }
           const overallPercent = Math.round(nextFiles.reduce((sum, f) => sum + f.percent, 0) / nextFiles.length)

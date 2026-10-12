@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "concurrently -n \"backend,frontend\" -c \"blue.bold,magenta.bold\" --kill-others-on-fail \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "dev": "concurrently -n \"backend,frontend\" -c \"blue.bold,magenta.bold\" --kill-others-on-fail \"npm run dev --prefix backend\" \"wait-on -t 15000 http-get://localhost:45450/health && npm run dev --prefix frontend\"",
     "build": "npm run build --prefix backend && npm run build --prefix frontend"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.1.0",
+    "wait-on": "^9.5.1"
   }
 }
