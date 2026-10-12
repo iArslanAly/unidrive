@@ -301,6 +301,18 @@ export function SettingsPage() {
     const popup = window.open('', 'google-drive-connect', 'width=540,height=720')
     if (popup) {
       popup.document.write('<html><head><title>Connecting...</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;color:#64748b;}</style></head><body><div style="text-align:center;"><h2>Connecting to Google...</h2><p>Please wait while we redirect you.</p></div></body></html>')
+      // Fallback handshake: if the popup closes without delivering a postMessage
+      // (blocked by browser policy), refetch once the window disappears so the
+      // dashboard never shows a stale "No Drives Connected" state.
+      const openedAt = Date.now()
+      const poll = window.setInterval(() => {
+        if (!popup.closed && Date.now() - openedAt < 10 * 60_000) return
+        window.clearInterval(poll)
+        if (!popup.closed) return
+        load().then(() => {
+          window.dispatchEvent(new Event('9drive:storage-changed'))
+        }).catch(() => undefined)
+      }, 800)
     }
     try {
       const data = await apiFetch<{ url: string }>('/connected-accounts/google/connect-url')

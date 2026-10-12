@@ -6,10 +6,10 @@ import { ArchivedPage } from '@/pages/ArchivedPage'
 import { LoginPage } from '@/pages/LoginPage'
 import { GoogleAuthPage } from '@/pages/GoogleAuthPage'
 import { GoogleConnectedPage } from '@/pages/GoogleConnectedPage'
-import { QuotaTrackerPage } from '@/pages/QuotaTrackerPage'
 import { RecentPage } from '@/pages/RecentPage'
 import { RegisterPage } from '@/pages/RegisterPage'
 import { SettingsPage } from '@/pages/SettingsPage'
+import { StoragePoolsPage } from '@/pages/StoragePoolsPage'
 import { VaultManifestPage } from '@/pages/VaultManifestPage'
 import { SharedPage } from '@/pages/SharedPage'
 import { StarredPage } from '@/pages/StarredPage'
@@ -34,7 +34,7 @@ function App() {
         <Route element={<DriveLayout />}>
           <Route index element={<Navigate to="/all-files" replace />} />
           <Route path="all-files" element={<AllFilesPage />} />
-          <Route path="quota" element={<QuotaTrackerPage />} />
+          <Route path="quota" element={<StoragePoolsPage />} />
           <Route path="shared" element={<SharedPage />} />
           <Route path="recent" element={<RecentPage />} />
           <Route path="starred" element={<StarredPage />} />

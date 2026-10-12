@@ -1,4 +1,6 @@
 import { Router } from 'express'
+import http from 'node:http'
+import https from 'node:https'
 import { google } from 'googleapis'
 import { z } from 'zod'
 import { env } from '../../config/env.js'
@@ -8,6 +10,56 @@ import { decryptText, encryptText, hashToken, randomToken } from '../../utils/cr
 import { hashPassword } from '../../utils/password.js'
 import { createOAuthClient, syncGoogleQuota } from '../google/google.service.js'
 import { syncS3Quota, testS3Connection } from '../s3/s3.service.js'
+
+// Persistent keep-alive sockets for outbound HTTPS (Google OAuth/Drive). Frequent
+// short-lived connections were triggering `ECONNRESET` / `terminated` errors during
+// the token exchange. Node 20+ defaults to keep-alive, but we pin it explicitly
+// with a generous timeout and socket ceiling so concurrent refreshes reuse sockets.
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, timeout: 60_000, maxSockets: 64 })
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, timeout: 60_000, maxSockets: 64 })
+https.globalAgent = keepAliveHttpsAgent
+http.globalAgent = keepAliveHttpAgent
+
+/**
+ * True when an error looks like a transient network drop rather than a permanent
+ * failure (bad code, invalid_grant). Google's token endpoint occasionally resets
+ * the socket mid-request (`ECONNRESET`, `socket hang up`, `terminated`); these are
+ * safe to retry because the exchange never completed.
+ */
+function isTransientNetworkError(error: unknown): boolean {
+  const code = (error as { code?: string })?.code
+  if (code && ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'ESOCKETTIMEDOUT'].includes(code)) return true
+  const message = String((error as { message?: string })?.message ?? '').toLowerCase()
+  return message.includes('econnreset') || message.includes('socket hang up') || message.includes('terminated') || message.includes('network')
+}
+
+/** Retries a promise-producing fn up to `attempts` times on transient network errors. */
+async function withNetworkRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error
+      if (!isTransientNetworkError(error) || i === attempts - 1) throw error
+      const backoff = 300 * 2 ** i // 300ms, 600ms
+      await new Promise((resolve) => setTimeout(resolve, backoff))
+    }
+  }
+  throw lastError
+}
+
+/** Popup-friendly HTML error page for interrupted Google connects. */
+function googleInterruptedErrorPage() {
+  return `<!DOCTYPE html>
+<html>
+  <head><title>Connection Interrupted - UniDrive</title></head>
+  <body style="background:#09090b;color:#f87171;font-family:sans-serif;text-align:center;padding:40px;">
+    <h3>Connection to Google was interrupted.</h3>
+    <p>Please close this window and try connecting again.</p>
+  </body>
+</html>`
+}
 
 export const connectedAccountRouter = Router()
 
@@ -25,6 +77,50 @@ const s3ConnectSchema = z.object({
 async function syncQuotaForAccount(account: { id: string; provider: string }) {
   if (account.provider === 's3') return syncS3Quota(account.id)
   return syncGoogleQuota(account.id)
+}
+
+type StorageAccountRow = {
+  totalBytes: bigint | null
+  usedBytes: bigint
+  availableBytes: bigint | null
+  trashBytes: bigint | null
+}
+
+type SerializableConnectedAccount = {
+  accessTokenEncrypted: string | null
+  refreshTokenEncrypted: string | null
+  usedSpace: bigint
+  allocatedSpace: bigint | null
+  storageAccount?: StorageAccountRow | null
+}
+
+/**
+ * Prepares a connected-account row for a JSON response: encrypted token
+ * material is never sent to clients, and every BigInt column (usedSpace,
+ * allocatedSpace, quota bytes) is converted to a string because `res.json`
+ * throws `Do not know how to serialize a BigInt`. Without this, the list
+ * endpoint 500s while `/storage/summary` succeeds, desyncing the sidebar
+ * "connected drives" state from the displayed quota.
+ */
+function serializeConnectedAccount(
+  account: SerializableConnectedAccount,
+  storageAccount: StorageAccountRow | null | undefined = account.storageAccount,
+) {
+  const { accessTokenEncrypted: _a, refreshTokenEncrypted: _r, storageAccount: _sa, ...rest } = account
+  return {
+    ...rest,
+    usedSpace: account.usedSpace.toString(),
+    allocatedSpace: account.allocatedSpace?.toString() ?? null,
+    storageAccount: storageAccount
+      ? {
+        ...storageAccount,
+        totalBytes: storageAccount.totalBytes?.toString() ?? null,
+        usedBytes: storageAccount.usedBytes.toString(),
+        availableBytes: storageAccount.availableBytes?.toString() ?? null,
+        trashBytes: storageAccount.trashBytes?.toString() ?? null,
+      }
+      : null,
+  }
 }
 
 connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next) => {
@@ -46,16 +142,7 @@ connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next)
       : accounts
 
     return res.json({
-      accounts: syncedAccounts.map(({ accessTokenEncrypted: _a, refreshTokenEncrypted: _r, storageAccount, ...account }) => ({
-        ...account,
-        storageAccount: storageAccount ? {
-          ...storageAccount,
-          totalBytes: storageAccount.totalBytes?.toString() ?? null,
-          usedBytes: storageAccount.usedBytes.toString(),
-          availableBytes: storageAccount.availableBytes?.toString() ?? null,
-          trashBytes: storageAccount.trashBytes?.toString() ?? null,
-        } : null,
-      })),
+      accounts: syncedAccounts.map((account) => serializeConnectedAccount(account)),
     })
   } catch (error) {
     return next(error)
@@ -142,10 +229,7 @@ connectedAccountRouter.post('/s3', requireAuth, async (req: AuthRequest, res, ne
       await testS3Connection(config)
       const quota = await syncS3Quota(account.id)
       return res.status(201).json({
-        account: {
-          ...account,
-          storageAccount: { ...quota, totalBytes: quota.totalBytes?.toString() ?? null, usedBytes: quota.usedBytes.toString(), availableBytes: quota.availableBytes?.toString() ?? null, trashBytes: quota.trashBytes?.toString() ?? null },
-        },
+        account: serializeConnectedAccount(account, quota),
       })
     } catch (error) {
       if (!existingAccount) await prisma.connectedAccount.delete({ where: { id: account.id } }).catch(() => undefined)
@@ -180,7 +264,9 @@ connectedAccountRouter.get('/google/callback', async (req, res, next) => {
     const oauthState = await prisma.oauthState.findUniqueOrThrow({ where: { stateHash: hashToken(query.state) }, include: { providerConfig: true } })
     if (oauthState.usedAt || oauthState.expiresAt < new Date()) return res.status(400).json({ code: 'GOOGLE_OAUTH_STATE_INVALID', message: 'OAuth state expired.' })
     const client = createOAuthClient(oauthState.providerConfig)
-    const tokenResult = await client.getToken(query.code)
+    // Google occasionally resets the socket mid-exchange (ECONNRESET / terminated).
+    // Retry transient network drops with exponential backoff before giving up.
+    const tokenResult = await withNetworkRetry(() => client.getToken(query.code), 3)
     const tokens = tokenResult.tokens
     if (!tokens.access_token) return res.status(400).json({ code: 'GOOGLE_OAUTH_FAILED', message: 'Google did not return required tokens.' })
     client.setCredentials(tokens)
@@ -273,10 +359,43 @@ connectedAccountRouter.get('/google/callback', async (req, res, next) => {
     })
     await prisma.oauthState.update({ where: { id: oauthState.id }, data: { usedAt: new Date() } })
     await syncGoogleQuota(account.id)
-    return res.redirect(`${env.FRONTEND_URL}/google-connected?status=success`)
+    // Popup-aware handshake: notify the opener immediately so the dashboard can
+    // refetch accounts/quota without a manual hard refresh. Falls back to the
+    // /google-connected page when the OAuth flow ran in the same window.
+    const successRedirect = `${env.FRONTEND_URL}/google-connected?status=success`
+    return res.status(200).type('html').send(`<!DOCTYPE html>
+<html>
+  <head><title>Account Connected - UniDrive</title></head>
+  <body style="background:#09090b;color:#a1a1aa;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+    <p>Account connected successfully. Closing...</p>
+    <script>
+      (function () {
+        try {
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage({ type: 'UNIDRIVE_OAUTH_SUCCESS', provider: 'google' }, ${JSON.stringify(env.FRONTEND_URL)});
+            setTimeout(function () { window.close(); }, 600);
+          } else {
+            window.location.replace(${JSON.stringify(successRedirect)});
+          }
+        } catch (err) {
+          console.error('Failed to notify parent window:', err);
+          window.location.replace(${JSON.stringify(successRedirect)});
+        }
+      })();
+    </script>
+  </body>
+</html>`)
   } catch (error) {
     console.error('Google OAuth callback failed:', error)
-    return res.redirect(`${env.FRONTEND_URL}/google-connected?status=error`)
+    // Render a friendly popup page for interrupted/failed connects instead of
+    // redirecting or crashing. Keep the legacy redirect as a fallback path for
+    // non-network errors where the redirect target is more appropriate.
+    if (isTransientNetworkError(error)) {
+      if (!res.headersSent) return res.status(502).type('html').send(googleInterruptedErrorPage())
+      return
+    }
+    if (!res.headersSent) return res.redirect(`${env.FRONTEND_URL}/google-connected?status=error`)
+    return
   }
 })
 

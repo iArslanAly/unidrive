@@ -274,17 +274,46 @@ export async function uploadChunkedFile(params: {
       params.log?.('vault chunk upload started', { virtualFileId: virtualFile.id, chunkIndex: chunk.chunkIndex, size: chunk.size.toString(), account: chunk.account.email })
 
       const sink = new PassThrough()
+      // An 'error' event without a listener would crash the process; swallow it
+      // here because the uploadPromise failure below carries the real reason.
+      sink.on('error', () => undefined)
       const uploadPromise = uploadChunkToGoogle(chunk.account, sink, chunk.size, partName, mimeType)
+      // Attach a rejection handler immediately: if the Google call fails while
+      // the source is still being written, Node would otherwise register an
+      // unhandled rejection (default: process exit) → dropped socket → the
+      // browser surfaces "NetworkError when attempting to fetch resource."
+      const settled = uploadPromise.then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+      )
 
-      let written = 0n
-      while (written < chunk.size) {
-        const buf = await reader.read(chunk.size - written)
-        if (!buf || buf.length === 0) throw new Error('Source stream ended before planned chunk boundary.')
-        await writeWithBackpressure(sink, buf)
-        written += BigInt(buf.length)
+      let remoteFileId: string
+      try {
+        const writePhase = (async () => {
+          let written = 0n
+          while (written < chunk.size) {
+            const buf = await reader.read(chunk.size - written)
+            if (!buf || buf.length === 0) throw new Error('Source stream ended before planned chunk boundary.')
+            await writeWithBackpressure(sink, buf)
+            written += BigInt(buf.length)
+          }
+          sink.end()
+        })()
+        // Fail fast when the provider rejects mid-write — otherwise backpressure
+        // would wait forever on a sink nobody is draining.
+        await Promise.race([
+          writePhase,
+          settled.then((error) => {
+            if (error) throw error
+            // Provider succeeded early: let writePhase decide when we move on.
+            return new Promise<never>(() => undefined)
+          }),
+        ])
+        remoteFileId = await uploadPromise
+      } catch (error) {
+        sink.destroy()
+        throw error
       }
-      sink.end()
-      const remoteFileId = await uploadPromise
 
       await prisma.fileChunk.create({
         data: { fileId: virtualFile.id, chunkIndex: chunk.chunkIndex, size: chunk.size, providerEmail: chunk.account.email, remoteFileId },

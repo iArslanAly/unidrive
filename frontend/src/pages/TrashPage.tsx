@@ -3,7 +3,7 @@ import { RotateCcw, Trash2, ShieldAlert, FileText, CheckCircle2 } from 'lucide-r
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { PageHeader } from '@/components/drive/PageHeader'
-import { apiFetch, formatBytes } from '@/lib/api'
+import { apiFetch, formatBytes, formatDate } from '@/lib/api'
 
 type TrashFile = {
   id: string
@@ -191,7 +191,7 @@ export function TrashPage() {
                     </td>
                     <td className="p-4 text-sm font-semibold">{formatBytes(file.sizeBytes)}</td>
                     <td className="p-4 text-sm text-slate-500">
-                      {new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(file.deletedAt))}
+                      {formatDate(file.deletedAt)}
                     </td>
                     <td className="p-4 text-right">
                       <div className="flex items-center justify-end gap-2">

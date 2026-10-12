@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, type DragEvent, type FormEvent, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type MouseEvent } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Archive, CheckCircle, ClipboardPaste, CloudOff, CloudUpload, Download, FolderInput, FolderPlus, LayoutGrid, List, Plus, RefreshCw, Star, Trash2, Upload, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, CheckCircle, ChevronRight, ClipboardPaste, CloudOff, CloudUpload, Download, Film, FileText, Folder, FolderInput, FolderPlus, Image as ImageIcon, Info, LayoutGrid, List, Loader2, Music, Plus, RefreshCw, Trash2, Upload, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { DummyModal } from '@/components/drive/DummyModal'
@@ -8,33 +8,40 @@ import { EmptyAreaContextMenu } from '@/components/drive/EmptyAreaContextMenu'
 import { FileContextMenu } from '@/components/drive/FileContextMenu'
 import { FileDetailsDrawer } from '@/components/drive/FileDetailsDrawer'
 import { FileGrid } from '@/components/drive/FileGrid'
+import { FileInspector } from '@/components/drive/FileInspector'
 import { FileTable } from '@/components/drive/FileTable'
 import { FolderContextMenu } from '@/components/drive/FolderContextMenu'
-import { FolderGrid, type FolderSizeScale } from '@/components/drive/FolderGrid'
+import { FolderGrid } from '@/components/drive/FolderGrid'
 import { defaultFolderColor, defaultFolderIconUrl, folderColorOptions, folderIconOptions, normalizeFolderColor } from '@/components/drive/FolderVisual'
-import { PageHeader } from '@/components/drive/PageHeader'
 import { Input } from '@/components/ui/input'
 import { API_URL, apiFetch, formatBytes, formatDate } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
+import { cn } from '@/lib/utils'
 import { UniversalStage } from '@/components/drive/UniversalStage'
 import type { FileItem, FolderItem } from '@/data/drive-data'
 import { useUpload } from '@/context/UploadContext'
-import { useDriveLayoutActions } from '@/layouts/DriveLayout'
+import { useDriveLayoutActions } from '@/context/DriveLayoutContext'
+import { getCachedFiles, setCachedFiles, getCachedFolders, setCachedFolders, invalidateVaultCache } from '@/lib/vaultCache'
 
-type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
-type BackendFolder = { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; updatedAt: string }
+type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; thumbnailUrl?: string | null; providerFileId?: string | null; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
+type BackendFolder = { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; updatedAt: string; itemCount?: number }
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string }
-
-const sizeActiveClasses: Record<FolderSizeScale, string> = {
-  xs: 'bg-white text-slate-800 dark:bg-red-500/20 dark:text-red-300 dark:border-red-500/30 shadow-sm dark:shadow-none',
-  sm: 'bg-white text-slate-800 dark:bg-orange-500/20 dark:text-orange-300 dark:border-orange-500/30 shadow-sm dark:shadow-none',
-  md: 'bg-white text-slate-800 dark:bg-blue-500/20 dark:text-blue-300 dark:border-blue-500/30 shadow-sm dark:shadow-none',
-  lg: 'bg-white text-slate-800 dark:bg-purple-500/20 dark:text-purple-300 dark:border-purple-500/30 shadow-sm dark:shadow-none'
-}
+type StorageSummary = { totalBytes: string; usedBytes: string; availableBytes: string }
 
 type FileViewMode = 'list' | 'grid'
 
-const fileViewStorageKey = '9drive:all-files-view-mode'
+type SortField = 'name' | 'updatedAt' | 'sizeBytes' | 'mimeType'
+type SortDirection = 'asc' | 'desc'
+type TypeFilter = 'all' | 'video' | 'audio' | 'document' | 'image'
+
+const sortFieldLabel: Record<SortField, string> = {
+  name: 'Name',
+  updatedAt: 'Date Modified',
+  sizeBytes: 'File Size',
+  mimeType: 'File Type',
+}
+
+const fileViewStorageKey = 'unidrive_view_mode'
 
 function getStoredFileViewMode(): FileViewMode {
   const stored = localStorage.getItem(fileViewStorageKey)
@@ -54,11 +61,11 @@ function providerLabel(provider: string | undefined) {
 }
 
 function mapFile(file: BackendFile): FileItem {
-  return { id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: file.sizeBytes, createdAt: file.createdAt, accountEmail: file.connectedAccount?.email, accountProvider: providerLabel(file.connectedAccount?.provider), date: formatDate(file.createdAt), size: formatBytes(file.sizeBytes), access: file.connectedAccount?.email ?? providerLabel(file.connectedAccount?.provider), kind: mimeToKind(file.mimeType), shared: 1, folderId: file.folderId, folderName: file.folder?.name }
+  return { id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: file.sizeBytes, createdAt: file.createdAt, thumbnailUrl: file.thumbnailUrl ?? null, providerFileId: file.providerFileId ?? null, accountEmail: file.connectedAccount?.email, accountProvider: providerLabel(file.connectedAccount?.provider), date: formatDate(file.createdAt), size: formatBytes(file.sizeBytes), access: file.connectedAccount?.email ?? providerLabel(file.connectedAccount?.provider), kind: mimeToKind(file.mimeType), shared: 1, folderId: file.folderId, folderName: file.folder?.name }
 }
 
 function mapFolder(folder: BackendFolder): FolderItem {
-  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, updated: `Updated ${formatDate(folder.updatedAt)}` }
+  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, itemCount: folder.itemCount, updated: `Updated ${formatDate(folder.updatedAt)}` }
 }
 
 
@@ -122,6 +129,11 @@ export function AllFilesPage() {
   const [loading, setLoading] = useState(false)
   const [syncingDrive, setSyncingDrive] = useState(false)
   const [fileViewMode, setFileViewMode] = useState<FileViewMode>(getStoredFileViewMode)
+  const [sortField, setSortField] = useState<SortField>('updatedAt')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all')
+  const [sortMenuOpen, setSortMenuOpen] = useState(false)
+  const [inspectorFileId, setInspectorFileId] = useState<string | null>(null)
   const { uploadFiles } = useUpload()
   const [inviteOpen, setInviteOpen] = useState(false)
   const [inviteEmail, setInviteEmail] = useState('')
@@ -131,22 +143,17 @@ export function AllFilesPage() {
   const [inviteMessage, setInviteMessage] = useState('')
   const [inviting, setInviting] = useState(false)
   const [isDraggingFiles, setIsDraggingFiles] = useState(false)
-  const [folderSizeScale, setFolderSizeScale] = useState<FolderSizeScale>(() => {
-    const v = localStorage.getItem('9drive:folder-size')
-    return (v === 'xs' || v === 'sm' || v === 'md' || v === 'lg') ? v : 'md'
-  })
   const { setHeaderActions } = useDriveLayoutActions()
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
+  const [storageSummary, setStorageSummary] = useState<StorageSummary | null>(null)
   const [selectedTargetAccountId, setSelectedTargetAccountId] = useState('')
-
-  function changeFolderSize(scale: FolderSizeScale) {
-    setFolderSizeScale(scale)
-    localStorage.setItem('9drive:folder-size', scale)
-  }
 
   async function loadFiles() {
     const params = new URLSearchParams()
-    if (activeFolderId) params.set('folderId', activeFolderId)
+    // Strict folder scoping: root view requests folderId=null (root rows only)
+    // and folder view requests that folder's id — never omit folderId, which
+    // would return files from every folder.
+    params.set('folderId', activeFolderId ?? 'null')
     if (searchQuery) params.set('q', searchQuery)
 
     // Add advanced search filters
@@ -165,18 +172,31 @@ export function AllFilesPage() {
     if (endDate) params.set('endDate', endDate)
 
     const query = params.toString()
+    const cacheKey = query || 'folderId=null'
+    // SWR: paint cached rows instantly (0ms, no flash), then revalidate. The cache
+    // stores fully-mapped FileItems (dates already formatted via the safe
+    // formatDate), so a cache hit needs no re-mapping and preserves dates verbatim.
+    const cached = getCachedFiles<FileItem>(cacheKey)
+    if (cached) setFiles(cached.files)
     const path = query ? `/files?${query}` : '/files'
     const data = await apiFetch<{ files: BackendFile[] }>(path)
-    setFiles(data.files.map(mapFile))
+    const mapped = data.files.map(mapFile)
+    setCachedFiles(cacheKey, { files: mapped })
+    setFiles(mapped)
   }
 
   async function loadFolders() {
     const visiblePath = activeFolderId ? `/folders?parentId=${activeFolderId}` : '/folders'
+    const visibleKey = activeFolderId ? `parentId=${activeFolderId}` : 'root'
+    const cachedVisible = getCachedFolders<FolderItem>(visibleKey)
+    if (cachedVisible) setFolders(cachedVisible.folders)
     const [visibleData, allData] = await Promise.all([
       apiFetch<{ folders: BackendFolder[] }>(visiblePath),
       apiFetch<{ folders: BackendFolder[] }>('/folders?all=1'),
     ])
-    setFolders(visibleData.folders.map(mapFolder))
+    const mappedVisible = visibleData.folders.map(mapFolder)
+    setCachedFolders(visibleKey, { folders: mappedVisible })
+    setFolders(mappedVisible)
     setAllFolders(allData.folders.map(mapFolder))
   }
 
@@ -212,15 +232,23 @@ export function AllFilesPage() {
   }, [activeFolderId, searchQuery, reloadNonce])
 
   useEffect(() => {
-    async function loadConnectedAccounts() {
+    async function loadConnectedDrives() {
       try {
-        const data = await apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts')
-        setConnectedAccounts(data.accounts || [])
+        const [accountsData, summaryData] = await Promise.all([
+          apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts'),
+          apiFetch<StorageSummary>('/storage/summary'),
+        ])
+        setConnectedAccounts(accountsData.accounts || [])
+        setStorageSummary(summaryData)
       } catch (error) {
         console.error('Failed to load connected accounts:', error)
       }
     }
-    loadConnectedAccounts()
+    loadConnectedDrives()
+    // Keep the dropzone CTA reactive: quota syncs and OAuth connects dispatch
+    // this event, so the empty state flips to an Upload action without a reload.
+    window.addEventListener('9drive:storage-changed', loadConnectedDrives)
+    return () => window.removeEventListener('9drive:storage-changed', loadConnectedDrives)
   }, [])
 
   useEffect(() => {
@@ -228,6 +256,8 @@ export function AllFilesPage() {
       if (event.key === 'Escape') setContextMenu({ x: 0, y: 0, file: null })
       if (event.key === 'Escape') setFolderContextMenu({ x: 0, y: 0, folder: null })
       if (event.key === 'Escape') setEmptyContextMenu({ x: 0, y: 0, open: false })
+      if (event.key === 'Escape') setSortMenuOpen(false)
+      if (event.key === 'Escape') setInspectorFileId(null)
       if (event.ctrlKey && event.key.toLowerCase() === 'x' && activeFolderForMenu) {
         event.preventDefault()
         cutSelectedFolder(activeFolderForMenu)
@@ -260,6 +290,7 @@ export function AllFilesPage() {
     setFolderColor(defaultFolderColor)
     setFolderIconUrl(defaultFolderIconUrl)
     setFolderOpen(false)
+    invalidateVaultCache()
     await loadFolders()
   }
 
@@ -303,6 +334,7 @@ export function AllFilesPage() {
       const accounts = response.results.length
 
       setMessage(`Google Drive synced. ${created} added, ${updated} updated, ${deleted} removed across ${accounts} account${accounts === 1 ? '' : 's'}.`)
+      invalidateVaultCache()
       await loadAll()
       window.dispatchEvent(new Event('9drive:storage-changed'))
     } catch (error) {
@@ -423,6 +455,39 @@ export function AllFilesPage() {
     playFromStage(file).catch(() => undefined)
   }
 
+  /** Single-click on a file card: select it and slide in the Right Inspector. */
+  function selectFileForInspector(file: FileItem) {
+    if (!file.id) return
+    setInspectorFileId(file.id)
+    setActiveFile(file)
+  }
+
+  function closeInspector() {
+    setInspectorFileId(null)
+  }
+
+  function inspectorDownload(file: FileItem) {
+    setActiveFile(file)
+    downloadFile(file)
+  }
+
+  function inspectorMove(file: FileItem) {
+    setActiveFile(file)
+    setSelectedFolderId(file.folderId || '')
+    setMoveOpen(true)
+  }
+
+  function inspectorRename(file: FileItem) {
+    setActiveFile(file)
+    setRenameValue(file.name)
+    setRenameOpen(true)
+  }
+
+  function inspectorDelete(file: FileItem) {
+    setActiveFile(file)
+    setDeleteOpen(true)
+  }
+
   function handleDropzoneDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault()
     event.stopPropagation()
@@ -484,6 +549,7 @@ export function AllFilesPage() {
     if (!activeFile?.id) return
     await apiFetch(`/files/${activeFile.id}`, { method: 'PATCH', body: JSON.stringify({ name: renameValue }) })
     setRenameOpen(false)
+    invalidateVaultCache()
     await loadFiles()
   }
 
@@ -496,6 +562,7 @@ export function AllFilesPage() {
     setMoveOpen(false)
     setSelectedFolderId('')
     clearSelection()
+    invalidateVaultCache()
     await loadFiles()
   }
 
@@ -506,6 +573,7 @@ export function AllFilesPage() {
     else return
     setDeleteOpen(false)
     clearSelection()
+    invalidateVaultCache()
     await loadFiles()
     window.dispatchEvent(new Event('9drive:storage-changed'))
   }
@@ -599,6 +667,7 @@ export function AllFilesPage() {
     if (!activeFolderForMenu?.id) return
     await apiFetch(`/folders/${activeFolderForMenu.id}`, { method: 'PATCH', body: JSON.stringify({ name: folderRenameValue, color: folderRenameColor, iconUrl: folderRenameIconUrl }) })
     setFolderRenameOpen(false)
+    invalidateVaultCache()
     await loadFolders()
   }
 
@@ -606,6 +675,7 @@ export function AllFilesPage() {
     if (!activeFolderForMenu?.id) return
     await apiFetch(`/folders/${activeFolderForMenu.id}`, { method: 'DELETE' })
     setFolderDeleteOpen(false)
+    invalidateVaultCache()
     await loadFolders()
   }
 
@@ -621,6 +691,7 @@ export function AllFilesPage() {
     await apiFetch(`/folders/${cutFolder.id}`, { method: 'PATCH', body: JSON.stringify({ parentId: activeFolderId ?? null }) })
     setMessage(`Folder "${cutFolder.name}" moved.`)
     setCutFolder(null)
+    invalidateVaultCache()
     await loadFolders()
   }
 
@@ -633,6 +704,7 @@ export function AllFilesPage() {
 
   useEffect(() => {
     function handleUploadCompleted() {
+      invalidateVaultCache()
       loadAll().catch(() => undefined)
     }
     window.addEventListener('9drive:upload-completed', handleUploadCompleted)
@@ -641,24 +713,27 @@ export function AllFilesPage() {
 
   useEffect(() => {
     setHeaderActions(
-      <div className="flex items-center gap-2">
-        <Button size="sm" onClick={() => setUploadOpen(true)}>
+      <div className="flex items-center gap-1.5 sm:gap-2">
+        <Button size="sm" title="Upload files" onClick={() => setUploadOpen(true)}>
           <Upload className="h-3.5 w-3.5" />Upload
         </Button>
-        <Button size="sm" variant="outline" onClick={() => setFolderOpen(true)}>
-          <FolderPlus className="h-3.5 w-3.5" />New Folder
+        <Button size="sm" variant="ghost" className="px-2 text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 sm:px-3 md:px-4 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" title="New Folder" aria-label="New Folder" onClick={() => setFolderOpen(true)}>
+          <FolderPlus className="h-4 w-4" />
+          <span className="hidden md:inline">New Folder</span>
         </Button>
-        <Button size="sm" variant="outline" disabled={syncingDrive} onClick={syncGoogleDrive}>
-          <RefreshCw className={syncingDrive ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
-          {syncingDrive ? 'Syncing...' : 'Sync'}
+        <Button size="sm" variant="ghost" className="px-2 text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 sm:px-3 md:px-4 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" disabled={syncingDrive} title={syncingDrive ? 'Syncing...' : 'Sync with Google Drive'} aria-label={syncingDrive ? 'Syncing...' : 'Sync with Google Drive'} onClick={syncGoogleDrive}>
+          <RefreshCw className={syncingDrive ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
+          <span className="hidden md:inline">{syncingDrive ? 'Syncing...' : 'Sync'}</span>
         </Button>
       </div>
     )
   }, [syncingDrive])
 
 
-  const recentFolders = folders.slice(0, 4)
-  const moreFolders = folders.slice(4)
+  // Drives are "connected" when the accounts list has entries OR pooled quota
+  // exists in the storage summary — the empty dropzone must offer Upload (not
+  // Connect) whenever storage is already available.
+  const hasDrives = connectedAccounts.length > 0 || Number(storageSummary?.totalBytes ?? 0) > 0
   const activeFolder = allFolders.find((folder) => folder.id === activeFolderId)
   const folderBreadcrumbs = (() => {
     if (!activeFolder) return []
@@ -675,50 +750,243 @@ export function AllFilesPage() {
   })()
   const allVisibleSelected = files.length > 0 && files.every((file) => file.id && selectedFileIds.has(file.id))
 
+  // --- Client-side sorting + type filtering (no network re-fetch) ---
+  const filteredFiles = useMemo(() => {
+    if (typeFilter === 'all') return files
+    return files.filter((file) => {
+      if (typeFilter === 'video') return file.kind === 'video'
+      if (typeFilter === 'image') return file.kind === 'image'
+      if (typeFilter === 'audio') return (file.mimeType ?? '').startsWith('audio/')
+      if (typeFilter === 'document') return file.kind === 'doc' || file.kind === 'pdf'
+      return true
+    })
+  }, [files, typeFilter])
+
+  const sortedFiles = useMemo(() => {
+    const dir = sortDirection === 'asc' ? 1 : -1
+    const sorted = [...filteredFiles].sort((a, b) => {
+      let comparison = 0
+      if (sortField === 'name') {
+        comparison = a.name.localeCompare(b.name)
+      } else if (sortField === 'updatedAt') {
+        const aTime = a.createdAt ? new Date(a.createdAt).getTime() : new Date(a.date).getTime()
+        const bTime = b.createdAt ? new Date(b.createdAt).getTime() : new Date(b.date).getTime()
+        comparison = (Number.isNaN(aTime) ? 0 : aTime) - (Number.isNaN(bTime) ? 0 : bTime)
+      } else if (sortField === 'sizeBytes') {
+        const aSize = Number(a.sizeBytes ?? a.size?.replace(/[^\d.]/g, '') ?? 0)
+        const bSize = Number(b.sizeBytes ?? b.size?.replace(/[^\d.]/g, '') ?? 0)
+        comparison = (Number.isFinite(aSize) ? aSize : 0) - (Number.isFinite(bSize) ? bSize : 0)
+      } else if (sortField === 'mimeType') {
+        comparison = (a.mimeType ?? '').localeCompare(b.mimeType ?? '')
+      }
+      return comparison * dir
+    })
+    return sorted
+  }, [filteredFiles, sortField, sortDirection])
+
+  const sortedFolders = useMemo(() => {
+    const dir = sortDirection === 'asc' ? 1 : -1
+    const sorted = [...folders].sort((a, b) => {
+      let comparison = 0
+      if (sortField === 'name') {
+        comparison = a.name.localeCompare(b.name)
+      } else if (sortField === 'updatedAt') {
+        comparison = a.name.localeCompare(b.name)
+      } else {
+        comparison = a.name.localeCompare(b.name)
+      }
+      return comparison * dir
+    })
+    return sorted
+  }, [folders, sortField, sortDirection])
+
+  const typeCounts = useMemo(() => ({
+    all: files.length,
+    video: files.filter((f) => f.kind === 'video').length,
+    audio: files.filter((f) => (f.mimeType ?? '').startsWith('audio/')).length,
+    document: files.filter((f) => f.kind === 'doc' || f.kind === 'pdf').length,
+    image: files.filter((f) => f.kind === 'image').length,
+  }), [files])
+
+  const inspectorFile = inspectorFileId ? (files.find((file) => file.id === inspectorFileId) ?? null) : null
+
+  // On wide (desktop) viewports, auto-select the first visible file ONCE when the
+  // vault first loads so the Right Inspector renders immediately with metadata/
+  // preview/actions — eliminating the empty black void. Seeding only once means a
+  // later manual close (Escape / toggle / click-away) is respected and not undone.
+  const autoSelectedRef = useRef(false)
+  useEffect(() => {
+    if (autoSelectedRef.current) return
+    if (sortedFiles.length > 0 && typeof window !== 'undefined' && window.innerWidth >= 1024) {
+      const first = sortedFiles[0]
+      if (first?.id) {
+        autoSelectedRef.current = true
+        setInspectorFileId(first.id)
+        setActiveFile(first)
+      }
+    }
+  }, [sortedFiles])
+
   return (
     <>
-      <div onContextMenu={openEmptyContextMenu} className="min-h-[620px] w-full min-w-0">
-      <PageHeader title={activeFolder ? <span className="block min-w-0 truncate"><button className="text-blue-600 hover:underline" onClick={closeFolder}>All Files</button>{folderBreadcrumbs.map((folder, index) => <span key={folder.id}><span className="text-slate-400"> / </span>{index === folderBreadcrumbs.length - 1 ? <span>{folder.name}</span> : <button className="text-blue-600 hover:underline" onClick={() => folder.id && openFolderById(folder.id)}>{folder.name}</button>}</span>)}</span> : 'All Files'} />
-      {/* Action buttons row — visible on mobile/tablet, hidden on desktop (desktop uses header slot) */}
-      <div className="mt-4 flex flex-wrap items-center gap-2 lg:hidden">
-        <Button size="sm" onClick={() => setUploadOpen(true)}><Upload className="h-3.5 w-3.5" />Upload</Button>
-        <Button size="sm" variant="outline" onClick={() => setFolderOpen(true)}><FolderPlus className="h-3.5 w-3.5" />New Folder</Button>
-        <Button size="sm" variant="outline" disabled={syncingDrive} onClick={syncGoogleDrive}><RefreshCw className={syncingDrive ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />{syncingDrive ? 'Syncing...' : 'Sync'}</Button>
-      </div>
+      {/* Workstation layout: main browsing stage (scrolls) + optional inline Right Inspector. */}
+      <div className="flex h-full min-h-0 w-full overflow-hidden">
+      <div
+        onContextMenu={openEmptyContextMenu}
+        onClick={(event) => {
+          // Click-away: deselect the file / collapse the Inspector when clicking
+          // empty grid background (not a file card, not the sort dropdown).
+          const target = event.target as HTMLElement
+          if (target.closest('[data-file-card]')) return
+          if (target.closest('[role="menu"]')) return
+          if (target.closest('[data-sort-control]')) return
+          if (sortMenuOpen) setSortMenuOpen(false)
+          setInspectorFileId(null)
+        }}
+        className="flex min-h-0 min-w-0 flex-1 flex-col gap-6 overflow-y-auto px-6 py-6 text-zinc-900 lg:px-8 dark:text-zinc-100">
       {message ? <p className="mt-3 rounded-xl border border-blue-200/60 bg-blue-50 p-3 text-sm text-blue-700 dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300">{message}</p> : null}
-      {/* Folder grid only when folders exist; folder guidance lives in the empty dropzone below. */}
-      {!activeFolder && recentFolders.length > 0 ? <FolderGrid items={recentFolders} mobileTwoColumns sizeScale={folderSizeScale} onFolderMenu={openFolderMenu} onFolderOpen={openFolder} onDropItem={handleDropItem} /> : null}
-      {!activeFolder && moreFolders.length > 0 ? <>
-        <h2 className="mt-4 font-extrabold text-slate-700">More Folders</h2>
-        <FolderGrid items={moreFolders} sizeScale={folderSizeScale} onFolderMenu={openFolderMenu} onFolderOpen={openFolder} onDropItem={handleDropItem} />
-      </> : null}
-      {activeFolder && folders.length > 0 ? <>
-        <h2 className="mt-4 font-extrabold text-slate-700">Folders</h2>
-        <FolderGrid items={folders} sizeScale={folderSizeScale} onFolderMenu={openFolderMenu} onFolderOpen={openFolder} onDropItem={handleDropItem} />
-      </> : null}
-      <div className="mt-4 flex flex-col gap-2 sm:mt-5 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="hidden items-center gap-0.5 rounded-xl border border-slate-200 bg-slate-50 p-0.5 sm:flex dark:border-zinc-800/80 dark:bg-zinc-900/60">
-            <Button variant="ghost" className="h-8 gap-1.5 px-2.5 text-xs font-bold text-slate-500 hover:bg-white hover:text-slate-900 hover:shadow-sm dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" onClick={() => navigate('/recent')}>
-              <Archive className="h-3.5 w-3.5" />Recents
-            </Button>
-            <Button variant="ghost" className="h-8 gap-1.5 px-2.5 text-xs font-bold text-slate-500 hover:bg-white hover:text-slate-900 hover:shadow-sm dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100" onClick={() => navigate('/starred')}>
-              <Star className="h-3.5 w-3.5" />Starred
-            </Button>
+      {/* Global page header: identity on the left, display controls on the right. No filter chips here. */}
+      <div className="mb-8 flex w-full flex-col gap-4 border-b border-white/[0.08] pb-5">
+        {/* Page Identity (Left) + Viewport Controls (Right) */}
+        <div className="flex items-center justify-between gap-4">
+        {/* Left: Title (root) or breadcrumbs (subfolder) — never wraps. */}
+        <nav className="flex min-w-0 shrink items-center gap-2 text-sm">
+          {folderBreadcrumbs.length === 0 ? (
+            <div className="flex shrink-0 items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-400">
+                <Folder className="h-4 w-4" />
+              </div>
+              <div>
+                <h1 className="text-lg font-semibold leading-tight tracking-tight text-zinc-900 dark:text-white">
+                  All Files
+                </h1>
+                <p className="mt-0.5 font-mono text-[11px] text-zinc-400">
+                  {sortedFiles.length} {sortedFiles.length === 1 ? 'file' : 'files'} • {folders.length} {folders.length === 1 ? 'folder' : 'folders'}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <>
+              <button
+                onClick={closeFolder}
+                className="flex items-center gap-1.5 font-medium text-zinc-500 transition-colors hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+              >
+                <Folder className="h-4 w-4 text-zinc-400 dark:text-zinc-500" />
+                <span>All Files</span>
+              </button>
+
+              {folderBreadcrumbs.map((folder, index) => (
+                <span key={folder.id} className="flex min-w-0 items-center gap-2">
+                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-zinc-400 dark:text-zinc-600" />
+                  {index === folderBreadcrumbs.length - 1 ? (
+                    <span className="flex min-w-0 items-center gap-2 font-semibold text-zinc-900 dark:text-white">
+                      <span className="truncate">{folder.name}</span>
+                      <span className="shrink-0 rounded-full border border-zinc-200 bg-zinc-100 px-2 py-0.5 text-xs font-normal text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+                        {files.length} {files.length === 1 ? 'item' : 'items'}
+                      </span>
+                    </span>
+                  ) : (
+                    <button className="truncate font-medium text-zinc-500 transition-colors hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100" onClick={() => folder.id && openFolderById(folder.id)}>{folder.name}</button>
+                  )}
+                </span>
+              ))}
+            </>
+          )}
+        </nav>
+
+        {/* Right: Display Settings Only (View Toggle + Sort + Inspector) */}
+        <div className="flex shrink-0 items-center gap-2">
+
+          {/* Bulk-selection actions (when active) */}
+          {selectedFileIds.size > 0 ? <div className="flex items-center gap-2"><span className="text-sm font-extrabold text-slate-700 dark:text-zinc-300">{selectedFileIds.size} selected</span><div className="flex gap-1.5"><Button className="h-8" variant="outline" onClick={downloadBatchAsZip}><Download className="h-4 w-4" />ZIP</Button><Button className="h-8" variant="outline" onClick={() => setMoveOpen(true)}><FolderInput className="h-4 w-4" />Move</Button><Button className="h-8" variant="danger" onClick={() => setDeleteOpen(true)}><Trash2 className="h-4 w-4" />Delete</Button><Button className="h-8" variant="ghost" onClick={clearSelection}>Clear</Button></div></div> : null}
+
+          {/* Grid / List Switcher */}
+          <div className="flex items-center rounded-xl border border-white/10 bg-zinc-900/80 p-1">
+            <button onClick={() => changeFileViewMode('grid')} className={cn('rounded-lg p-1.5 transition-all', fileViewMode === 'grid' ? 'bg-white/15 text-white shadow-sm' : 'text-zinc-400 hover:text-zinc-200')} aria-label="Grid view" aria-pressed={fileViewMode === 'grid'} title="Grid View"><LayoutGrid className="h-3.5 w-3.5" /></button>
+            <button onClick={() => changeFileViewMode('list')} className={cn('rounded-lg p-1.5 transition-all', fileViewMode === 'list' ? 'bg-white/15 text-white shadow-sm' : 'text-zinc-400 hover:text-zinc-200')} aria-label="List view" aria-pressed={fileViewMode === 'list'} title="List View"><List className="h-3.5 w-3.5" /></button>
           </div>
-          {selectedFileIds.size > 0 ? <div className="flex w-full flex-col gap-3 rounded-2xl border border-orange-500/20 bg-orange-500/10 p-3 sm:w-auto sm:flex-row sm:items-center sm:border-0 sm:bg-transparent sm:p-0"><span className="text-sm font-extrabold text-slate-700">{selectedFileIds.size} selected</span><div className="grid grid-cols-4 gap-2 sm:flex sm:gap-3"><Button className="w-full" variant="outline" onClick={downloadBatchAsZip}><Download className="h-4 w-4" />ZIP</Button><Button className="w-full" variant="outline" onClick={() => setMoveOpen(true)}><FolderInput className="h-4 w-4" />Move</Button><Button className="w-full" variant="danger" onClick={() => setDeleteOpen(true)}><Trash2 className="h-4 w-4" />Delete</Button><Button className="w-full" variant="ghost" onClick={clearSelection}>Clear</Button></div></div> : null}
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-0.5 rounded-xl border border-slate-200 bg-slate-50 p-0.5">
-            {(['xs','sm','md','lg'] as FolderSizeScale[]).map((s) => (
-              <button key={s} type="button" onClick={() => changeFolderSize(s)} className={['rounded-lg px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-all border border-transparent', folderSizeScale === s ? sizeActiveClasses[s] : 'text-slate-400 hover:text-slate-600'].join(' ')} aria-label={`Folder size ${s}`} aria-pressed={folderSizeScale === s}>{s}</button>
-            ))}
+
+          {/* Sort menu: single container — field button + divider + Asc/Desc toggle. */}
+          <div data-sort-control="" className="relative flex items-center rounded-xl border border-white/10 bg-zinc-900/80 p-1">
+            <button
+              onClick={() => setSortMenuOpen((open) => !open)}
+              aria-haspopup="menu"
+              aria-expanded={sortMenuOpen}
+              className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-zinc-200 transition-colors hover:text-white"
+            >
+              <ArrowUpDown className="h-3 w-3 text-zinc-400" />
+              <span>{sortFieldLabel[sortField]}</span>
+            </button>
+            <div className="mx-1 h-3.5 w-px bg-white/10" />
+            <button
+              onClick={() => setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc')}
+              className="rounded-lg p-1 text-zinc-400 transition-colors hover:text-white"
+              aria-label={sortDirection === 'asc' ? 'Sorted ascending' : 'Sorted descending'}
+              title={sortDirection === 'asc' ? 'Ascending' : 'Descending'}
+            >
+              {sortDirection === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />}
+            </button>
+
+            {sortMenuOpen ? (
+              <div
+                role="menu"
+                className="absolute right-0 top-11 z-30 w-56 overflow-hidden rounded-2xl border border-white/[0.08] bg-[#0e0f16]/95 p-1.5 shadow-2xl backdrop-blur-xl"
+              >
+                {([
+                  { field: 'name' as SortField, label: 'Name', hint: sortDirection === 'asc' ? 'A to Z' : 'Z to A' },
+                  { field: 'updatedAt' as SortField, label: 'Date Modified', hint: sortDirection === 'asc' ? 'Oldest' : 'Newest' },
+                  { field: 'sizeBytes' as SortField, label: 'File Size', hint: sortDirection === 'asc' ? 'Smallest' : 'Largest' },
+                  { field: 'mimeType' as SortField, label: 'File Type', hint: 'Categorical' },
+                ]).map((option) => (
+                  <button
+                    key={option.field}
+                    role="menuitemradio"
+                    aria-checked={sortField === option.field}
+                    onClick={() => { setSortField(option.field); setSortMenuOpen(false) }}
+                    className={cn(
+                      'flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-xs font-medium transition-colors',
+                      sortField === option.field ? 'bg-blue-500/10 text-blue-300' : 'text-zinc-300 hover:bg-white/5 hover:text-white'
+                    )}
+                  >
+                    <span>{option.label}</span>
+                    <span className="font-mono text-[10px] uppercase text-zinc-500">{option.hint}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
-          <div className="h-6 w-px bg-slate-200" />
-          <div className="flex gap-3"><Button variant={fileViewMode === 'grid' ? 'soft' : 'outline'} size="icon" aria-label="Show files as grid" aria-pressed={fileViewMode === 'grid'} onClick={() => changeFileViewMode('grid')}><LayoutGrid className="h-5 w-5" /></Button><Button variant={fileViewMode === 'list' ? 'soft' : 'outline'} size="icon" aria-label="Show files as list" aria-pressed={fileViewMode === 'list'} onClick={() => changeFileViewMode('list')}><List className="h-5 w-5" /></Button></div>
+
+          {/* Inspector toggle — show/hide the Right Inspector panel on demand. */}
+          <button
+            onClick={() => setInspectorFileId(inspectorFileId ? null : (sortedFiles[0]?.id || null))}
+            className={cn(
+              'flex h-9 w-9 items-center justify-center rounded-xl border transition-all',
+              inspectorFileId
+                ? 'border-blue-500/40 bg-blue-600/20 text-blue-400 shadow-sm'
+                : 'border-white/10 bg-zinc-900/80 text-zinc-400 hover:text-white'
+            )}
+            title="Toggle File Details Inspector"
+            aria-pressed={inspectorFileId != null}
+          >
+            <Info className="h-3.5 w-3.5" />
+          </button>
         </div>
+      </div>
       </div>
       {cutFolder ? <p className="mt-3 rounded-xl border border-amber-200/60 bg-amber-50 p-3 text-sm font-semibold text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300"><ClipboardPaste className="mr-2 inline h-4 w-4" />Cut folder: {cutFolder.name}. Press Ctrl+V or right-click empty area to paste here.</p> : null}
+      {/* Folders in the current scope (root or active folder) — inline shelf, no full-width void. */}
+      {!loadError && folders.length > 0 ? (
+        <section>
+          <div className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+            <span>Folders</span>
+            <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 font-mono text-[10px] text-amber-500 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-500">
+              {folders.length}
+            </span>
+          </div>
+          <FolderGrid items={sortedFolders} onFolderMenu={openFolderMenu} onFolderOpen={openFolder} onDropItem={handleDropItem} />
+        </section>
+      ) : null}
+
       {loadError ? (
         <div className="mt-3 flex flex-col items-center gap-3 rounded-2xl border border-red-500/20 bg-red-500/5 px-6 py-14 text-center backdrop-blur-sm dark:border-red-500/15">
           <CloudOff className="h-10 w-10 text-red-500/80" />
@@ -730,36 +998,139 @@ export function AllFilesPage() {
             <RefreshCw className="h-3.5 w-3.5" />Retry
           </Button>
         </div>
-      ) : files.length === 0 ? (
-        searchQuery ? (
-          <Card className="mt-3 border-slate-200/80 bg-white/70 p-5 dark:border-zinc-800/80 dark:bg-zinc-900/60">
-            <p className="text-sm text-slate-500 dark:text-slate-400">No files found for "{searchQuery}".</p>
-          </Card>
-        ) : (
-          <div
-            onDragOver={(event) => { event.preventDefault(); setIsDraggingFiles(true) }}
-            onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setIsDraggingFiles(false) }}
-            onDrop={handleDropzoneDrop}
-            onClick={() => setUploadOpen(true)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setUploadOpen(true) } }}
-            aria-label="Upload dropzone"
-            className={[
-              'mt-3 flex cursor-pointer flex-col items-center justify-center gap-4 rounded-2xl border-2 border-dashed px-6 py-16 text-center transition-all',
-              isDraggingFiles
-                ? 'scale-[1.01] border-blue-500 bg-blue-50/80 shadow-lg shadow-blue-500/10 dark:border-blue-500/70 dark:bg-blue-950/40'
-                : 'bg-white/60 border-slate-300 hover:border-blue-400 dark:bg-zinc-900/60 dark:border-zinc-800/80 dark:hover:border-blue-500/60',
-            ].join(' ')}
-          >
-            <div className={['flex h-16 w-16 items-center justify-center rounded-2xl transition-colors', isDraggingFiles ? 'bg-blue-600 text-white' : 'bg-blue-600/10 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400'].join(' ')}>
-              <CloudUpload className="h-8 w-8" />
+      ) : files.length > 0 ? (
+        <section className="mt-8 flex flex-col gap-4">
+          {/* Unified Left-Aligned Files Toolbar: label + divider + filter pills, all anchored to the left. */}
+          <div className="flex items-center gap-3 overflow-x-auto pb-1 no-scrollbar">
+            {/* Section Label */}
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="font-mono text-xs font-bold uppercase tracking-wider text-zinc-400">
+                Files
+              </span>
+              <span className="rounded-full bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
+                {sortedFiles.length}
+              </span>
             </div>
-            <div className="grid gap-1.5">
-              <p className="text-base font-extrabold text-slate-900 dark:text-slate-100">Drag and drop files to pool &amp; upload</p>
-              <p className="max-w-md text-sm text-slate-500 dark:text-slate-400">Files larger than single account quotas are automatically chunked across connected drives.</p>
-              <p className="max-w-md text-xs text-zinc-400">No folders yet? Click New Folder to organize uploads.</p>
+
+            {/* Subtle Vertical Divider */}
+            <div className="mx-1 h-4 w-px shrink-0 bg-white/10" />
+
+            {/* Filter Pills Group (Anchored to the Left with Label) */}
+            <div className="flex shrink-0 items-center gap-1.5">
+              {([
+                { id: 'all' as TypeFilter, label: 'All', count: typeCounts.all, icon: null },
+                { id: 'video' as TypeFilter, label: 'Videos', count: typeCounts.video, icon: Film },
+                { id: 'audio' as TypeFilter, label: 'Audio', count: typeCounts.audio, icon: Music },
+                { id: 'document' as TypeFilter, label: 'Docs', count: typeCounts.document, icon: FileText },
+                { id: 'image' as TypeFilter, label: 'Images', count: typeCounts.image, icon: ImageIcon },
+              ]).map((item) => {
+                const ChipIcon = item.icon
+                const isActive = typeFilter === item.id
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => setTypeFilter(item.id)}
+                    aria-pressed={isActive}
+                    className={cn(
+                      'flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-1 text-xs font-medium transition-all',
+                      isActive
+                        ? 'bg-blue-600 text-white shadow-sm shadow-blue-500/20'
+                        : 'border border-white/[0.06] bg-zinc-900/80 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+                    )}
+                  >
+                    {ChipIcon ? <ChipIcon className="h-3.5 w-3.5" /> : null}
+                    <span>{item.label}</span>
+                    <span className={cn(
+                      'rounded-full px-1.5 py-0.5 font-mono text-[10px]',
+                      isActive ? 'bg-blue-500 text-white' : 'bg-white/10 text-zinc-400'
+                    )}>
+                      {item.count}
+                    </span>
+                  </button>
+                )
+              })}
             </div>
+          </div>
+
+          <div className="w-full">
+            {sortedFiles.length === 0 ? (
+              <div className="rounded-2xl border border-white/[0.06] bg-zinc-900/40 p-8 text-center font-mono text-xs text-zinc-500">
+                No files found matching the selected filter.
+              </div>
+            ) : fileViewMode === 'grid' ? (
+              <FileGrid files={sortedFiles} selectedFileIds={selectedFileIds} selectedFileId={inspectorFileId} onToggleFile={toggleFileSelection} onFileContextMenu={openContext} onFileOpen={openStage} onFileSelect={selectFileForInspector} resolveThumbUrl={resolvePreviewUrl} />
+            ) : (
+              <FileTable files={sortedFiles} selectedFileIds={selectedFileIds} allSelected={allVisibleSelected} onToggleFile={toggleFileSelection} onToggleAll={toggleAllVisibleFiles} onFileContextMenu={openContext} onFileOpen={openStage} />
+            )}
+          </div>
+        </section>
+      ) : searchQuery ? (
+        <Card className="mt-3 border-slate-200/80 bg-white/70 p-5 dark:border-zinc-800/80 dark:bg-zinc-900/60">
+          <p className="text-sm text-slate-500 dark:text-slate-400">No files found for "{searchQuery}".</p>
+        </Card>
+      ) : activeFolder && folders.length === 0 ? (
+        /* Truly empty folder: clean Google-Drive-style empty state that still
+           accepts drag & drop and click-to-upload. */
+        <div
+          onDragOver={(event) => { event.preventDefault(); setIsDraggingFiles(true) }}
+          onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setIsDraggingFiles(false) }}
+          onDrop={handleDropzoneDrop}
+          onClick={() => setUploadOpen(true)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setUploadOpen(true) } }}
+          aria-label="Empty folder upload area"
+          className={[
+            'mt-3 flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-14 text-center transition-all',
+            isDraggingFiles
+              ? 'scale-[1.01] border-blue-500 bg-blue-50/80 shadow-lg shadow-blue-500/10 dark:border-blue-500/70 dark:bg-blue-950/40'
+              : 'bg-white/60 border-slate-300 hover:border-blue-400 dark:bg-zinc-900/60 dark:border-zinc-800/80 dark:hover:border-blue-500/60',
+          ].join(' ')}
+        >
+          <CloudUpload className="mb-3 h-8 w-8 text-slate-400 dark:text-zinc-500" />
+          <p className="text-sm font-semibold text-slate-600 dark:text-zinc-300">This folder is empty</p>
+          <p className="mt-1 text-xs text-slate-500 dark:text-zinc-400">Drag and drop files here to get started.</p>
+          <Button size="sm" className="mt-4" onClick={(event) => { event.stopPropagation(); setUploadOpen(true) }}>
+            <Upload className="h-4 w-4" />Upload Files
+          </Button>
+        </div>
+      ) : (
+        <div
+          onDragOver={(event) => { event.preventDefault(); setIsDraggingFiles(true) }}
+          onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setIsDraggingFiles(false) }}
+          onDrop={handleDropzoneDrop}
+          onClick={() => setUploadOpen(true)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setUploadOpen(true) } }}
+          aria-label="Upload dropzone"
+          className={[
+            'mt-3 flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-16 text-center transition-all',
+            isDraggingFiles
+              ? 'scale-[1.01] border-blue-500 bg-blue-50/80 shadow-lg shadow-blue-500/10 dark:border-blue-500/70 dark:bg-blue-950/40'
+              : 'bg-white/60 border-slate-300 hover:border-blue-400 dark:bg-zinc-900/60 dark:border-zinc-800/80 dark:hover:border-blue-500/60',
+          ].join(' ')}
+        >
+          <div className={['mb-3 flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border transition-colors', isDraggingFiles ? 'border-blue-500 bg-blue-600 text-white' : 'border-blue-500/20 bg-blue-500/10 text-blue-400'].join(' ')}>
+            <CloudUpload className="h-7 w-7" />
+          </div>
+          <div className="w-full">
+            <p className="text-base font-medium text-slate-700 dark:text-zinc-200">Drag and drop files to pool &amp; upload</p>
+            <p className="mx-auto text-sm text-slate-500 font-normal max-w-md text-center leading-relaxed mt-1 mb-6 dark:text-zinc-400">
+              {hasDrives
+                ? 'Drag and drop files here to pool and chunk across your connected storage.'
+                : 'Files larger than single account quotas are automatically chunked across connected drives.'}
+            </p>
+          </div>
+          {hasDrives ? (
+            <Button
+              size="sm"
+              className="bg-blue-600 hover:bg-blue-500 shadow-lg shadow-blue-500/20"
+              onClick={(event) => { event.stopPropagation(); setUploadOpen(true) }}
+            >
+              <Upload className="mr-2 h-4 w-4" />Upload Your First File
+            </Button>
+          ) : (
             <Button
               size="sm"
               className="shadow-lg shadow-blue-500/20 hover:shadow-blue-500/30"
@@ -767,17 +1138,26 @@ export function AllFilesPage() {
             >
               <Plus className="h-3.5 w-3.5" />Connect Storage Account
             </Button>
-          </div>
-        )
-      ) : (
-        <Card className="mt-3 border-slate-200/80 bg-white/70 p-4 sm:p-5 dark:border-zinc-800/80 dark:bg-zinc-900/60">
-          {fileViewMode === 'grid' ? (
-            <FileGrid files={files} selectedFileIds={selectedFileIds} sizeScale={folderSizeScale} onToggleFile={toggleFileSelection} onFileContextMenu={openContext} onFileOpen={openStage} />
-          ) : (
-            <FileTable files={files} selectedFileIds={selectedFileIds} allSelected={allVisibleSelected} onToggleFile={toggleFileSelection} onToggleAll={toggleAllVisibleFiles} onFileContextMenu={openContext} onFileOpen={openStage} />
           )}
-        </Card>
+        </div>
       )}
+      </div>
+
+      {/* Persistent inline Right Inspector Panel — reserves width beside the browsing stage on wide screens. */}
+      {inspectorFile ? (
+        <aside className="hidden h-full w-80 shrink-0 flex-col overflow-y-auto border-l border-white/[0.08] bg-zinc-950/80 backdrop-blur-xl md:flex lg:w-[352px]">
+          <FileInspector
+            open={inspectorFileId != null}
+            file={inspectorFile}
+            resolveThumbUrl={resolvePreviewUrl}
+            onClose={closeInspector}
+            onDownload={inspectorDownload}
+            onMove={inspectorMove}
+            onRename={inspectorRename}
+            onDelete={inspectorDelete}
+          />
+        </aside>
+      ) : null}
       </div>
       <EmptyAreaContextMenu x={emptyContextMenu.x} y={emptyContextMenu.y} open={emptyContextMenu.open} canPasteFolder={Boolean(cutFolder)} onClose={() => setEmptyContextMenu({ x: 0, y: 0, open: false })} onUpload={() => { setUploadOpen(true); setEmptyContextMenu({ x: 0, y: 0, open: false }) }} onCreateFolder={() => { setFolderOpen(true); setEmptyContextMenu({ x: 0, y: 0, open: false }) }} onPasteFolder={() => { pasteFolder().catch((error) => setMessage(error instanceof Error ? error.message : 'Failed to paste folder')); setEmptyContextMenu({ x: 0, y: 0, open: false }) }} />
       <FileContextMenu x={contextMenu.x} y={contextMenu.y} file={contextMenu.file} onClose={() => setContextMenu({ x: 0, y: 0, file: null })} onView={viewFile} onDownload={downloadFile} onRename={() => { setRenameValue(activeFile?.name ?? ''); setRenameOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onMove={() => { setMoveOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onDetails={() => { setDetailOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onShare={shareFile} onCopyLink={copyShareLinkDirect} onInvite={inviteToFile} onDelete={() => { setDeleteOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} />
@@ -881,23 +1261,34 @@ export function AllFilesPage() {
           <div className="flex justify-end gap-3 pt-2"><Button type="button" variant="outline" onClick={() => setInviteOpen(false)}>Cancel</Button><Button disabled={inviting}>{inviting ? 'Sending...' : 'Send Invite'}</Button></div>
         </form>
       </DummyModal>
-      <DummyModal open={previewOpen} title="File Preview" description={activeFile?.name ?? ''} onClose={closePreview} className="overflow-hidden sm:max-w-[95vw] xl:max-w-[1400px]">
-        <div className="flex h-[72dvh] w-full items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-50 sm:h-[80vh]">
-          {previewLoading ? <div className="p-6 text-center text-sm font-semibold text-slate-500">Loading preview...</div> : null}
-          {previewError ? <div className="p-6 text-center text-sm text-red-600">{previewError}</div> : null}
-          {!previewLoading && !previewError && activeFile && previewUrl ? (
-            <UniversalStage
-              file={activeFile}
-              queue={files}
-              previewUrl={previewUrl}
-              resolvePreviewUrl={resolvePreviewUrl}
-              onPlayFile={(file) => { playFromStage(file).catch(() => undefined) }}
-              onDownload={(file) => { downloadFile(file).catch(() => undefined) }}
-              onMediaError={() => setPreviewError('Failed to load preview.')}
-            />
-          ) : null}
+      {previewOpen && (previewLoading || previewError) ? (
+        <div className="fixed inset-0 z-50 flex animate-in flex-col items-center justify-center gap-4 bg-black/90 text-white backdrop-blur-2xl fade-in">
+          {previewLoading ? (
+            <>
+              <Loader2 className="h-8 w-8 animate-spin text-zinc-400" />
+              <p className="text-sm font-medium text-zinc-300">Loading preview...</p>
+            </>
+          ) : (
+            <>
+              <FileText className="h-10 w-10 text-rose-400" />
+              <p className="text-sm font-medium text-rose-300">{previewError}</p>
+              <button type="button" onClick={closePreview} className="rounded-xl border border-white/10 bg-white/10 px-4 py-2 text-xs font-medium text-white transition hover:bg-white/20">Close</button>
+            </>
+          )}
         </div>
-      </DummyModal>
+      ) : null}
+      {previewOpen && activeFile && !previewLoading && !previewError && previewUrl ? (
+        <UniversalStage
+          file={activeFile}
+          queue={files}
+          previewUrl={previewUrl}
+          resolvePreviewUrl={resolvePreviewUrl}
+          onPlayFile={(file) => { playFromStage(file).catch(() => undefined) }}
+          onDownload={(file) => { downloadFile(file).catch(() => undefined) }}
+          onMediaError={() => setPreviewError('Failed to load preview.')}
+          onClose={closePreview}
+        />
+      ) : null}
     </>
   )
 }

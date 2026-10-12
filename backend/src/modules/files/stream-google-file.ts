@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream'
 import type { Response } from 'express'
 import type { ConnectedAccount, File } from '@prisma/client'
 import { getAuthedGoogleClient } from '../google/google.service.js'
@@ -66,15 +67,13 @@ export async function streamGoogleFile(file: FileWithAccount, range: string | un
     res.end()
     return
   }
-  const reader = response.body.getReader()
-  async function pump(): Promise<void> {
-    const { done, value } = await reader.read()
-    if (done) {
-      res.end()
-      return
-    }
-    res.write(Buffer.from(value))
-    return pump()
-  }
-  return pump()
+  // Zero-buffer stream: pipe the Drive ReadableStream straight to the response so
+  // bytes flow through with native backpressure (no in-memory accumulation). The
+  // client's Range header was already forwarded, so Drive answers 206 and we relay
+  // that status + Content-Range — enabling instant seeking without full downloads.
+  const upstream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
+  // If the viewer disconnects (seek/close), stop pulling bytes from Drive.
+  res.on('close', () => { upstream.destroy() })
+  upstream.on('error', () => { res.destroy() })
+  return upstream.pipe(res)
 }

@@ -1,13 +1,18 @@
 // Generates a fun, unique avatar URL for a user based on their email.
-// Uses DiceBear "bottts" style (cute robots) as the default when no Gravatar is set.
-// Falls back to a random avatar when no email is provided.
-export async function getGravatarUrl(email: string | undefined, size: number) {
+//
+// IMPORTANT: this must NOT probe gravatar.com. The previous implementation fired
+// a `fetch(..., { method: 'HEAD' })` against Gravatar for every user, which logged
+// a 404 in the console for everyone without a Gravatar image (a "404 storm"). We
+// instead resolve directly to a DiceBear "bottts" avatar that ALWAYS returns an
+// image, so there is zero gravatar.com traffic and zero 404s. Callers render the
+// result in an <img onError> that falls back to an initials badge if even DiceBear
+// is unreachable (e.g. offline), so the avatar never breaks.
+export async function getGravatarUrl(email: string | undefined, size: number): Promise<string> {
   const normalized = email?.trim().toLowerCase()
-
-  // Hash the email for Gravatar lookup + as DiceBear seed
   const seed = normalized ?? 'default-user'
-  let hash = ''
 
+  // Hash the email to seed the avatar (SHA-256 when available, else a small hash).
+  let hash = ''
   if (typeof crypto !== 'undefined' && crypto.subtle) {
     try {
       const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(seed))
@@ -19,19 +24,7 @@ export async function getGravatarUrl(email: string | undefined, size: number) {
     hash = simpleHash(seed)
   }
 
-  // Try Gravatar first; fallback to DiceBear bottts (cute robots)
-  // d=404 means Gravatar returns 404 if no image → we catch and fall through to DiceBear
-  if (normalized && hash.length === 64) {
-    const gravatarUrl = `https://www.gravatar.com/avatar/${hash}?s=${size}&d=404`
-    try {
-      const res = await fetch(gravatarUrl, { method: 'HEAD' })
-      if (res.ok) return gravatarUrl
-    } catch {
-      // Network error → fall through
-    }
-  }
-
-  // DiceBear bottts — cute, colorful robot avatars
+  // DiceBear bottts — cute, colorful robot avatars (deterministic per email hash).
   return `https://api.dicebear.com/8.x/bottts/svg?seed=${encodeURIComponent(hash)}&size=${size}&backgroundColor=b6e3f4,c0aede,d1f4cc,ffdfbf,ffd5dc`
 }
 

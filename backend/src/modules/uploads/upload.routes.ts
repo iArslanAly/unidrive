@@ -14,8 +14,20 @@ import { createAuditLog } from '../../utils/audit.js'
 
 export const uploadRouter = Router()
 
+/** True when an error is caused by the client disconnecting mid-request (undici `TypeError: terminated`, AbortError, ECONNRESET). */
+function isClientAbortError(error: unknown): boolean {
+  if ((error as { name?: string })?.name === 'AbortError') return true
+  const code = (error as { code?: string })?.code
+  if (code && ['ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'].includes(code)) return true
+  const message = String((error as { message?: string })?.message ?? '').toLowerCase()
+  return message.includes('terminated') || message.includes('aborted') || message.includes('premature close') || message.includes('econnreset')
+}
+
 type UploadMeta = { fieldName: string; fileName: string; mimeType: string; sizeBytes: bigint; folderId?: string }
-type RoutingMode = 'most_available' | 'round_robin' | 'priority'
+/** Routing policy modes: Smart Auto, Priority Waterfall, Rule-Based. */
+type RoutingMode = 'auto' | 'priority' | 'rules'
+type RoutingTypeRules = { video?: string; document?: string; default?: string }
+const DEFAULT_SAFETY_CAP_PERCENT = 85
 
 function logUpload(message: string, metadata?: Record<string, unknown>) {
   console.info('[upload]', message, metadata ?? '')
@@ -58,6 +70,25 @@ function normalizePriorityAccountIds(value: unknown) {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
+/** Legacy rows may hold 'most_available' / 'round_robin'; both map to Smart Auto. */
+function normalizeRoutingMode(value: unknown): RoutingMode {
+  return value === 'priority' || value === 'rules' ? value : 'auto'
+}
+
+function parseTypeRules(value: unknown): RoutingTypeRules {
+  if (!value || typeof value !== 'object') return {}
+  const raw = value as Record<string, unknown>
+  const rules: RoutingTypeRules = {}
+  for (const key of ['video', 'document', 'default'] as const) {
+    if (typeof raw[key] === 'string' && raw[key]) rules[key] = raw[key] as string
+  }
+  return rules
+}
+
+function clampSafetyCap(value: unknown) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 100 ? value : DEFAULT_SAFETY_CAP_PERCENT
+}
+
 function byPriority<T extends { account: { id: string; createdAt: Date } }>(items: T[], priorityAccountIds: string[]) {
   const order = new Map(priorityAccountIds.map((id, index) => [id, index]))
   return [...items].sort((a, b) => {
@@ -70,7 +101,14 @@ function byPriority<T extends { account: { id: string; createdAt: Date } }>(item
   })
 }
 
-async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByAccount = new Map<string, bigint>(), targetAccountId?: string | null) {
+/** Exported for the routing-engine verification script (src/scripts). */
+export async function selectAccount(
+  userId: string,
+  sizeBytes: bigint,
+  reservedBytesByAccount = new Map<string, bigint>(),
+  targetAccountId?: string | null,
+  mimeType?: string | null,
+) {
   const accounts = await prisma.connectedAccount.findMany({
     where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
     include: { storageAccount: true },
@@ -98,37 +136,85 @@ async function selectAccount(userId: string, sizeBytes: bigint, reservedBytesByA
     include: { storageAccount: true },
   })
 
-  const eligible = fresh
-    .map((account) => ({ account, availableBytes: account.storageAccount?.availableBytes === null || account.storageAccount?.availableBytes === undefined ? null : account.storageAccount.availableBytes - (reservedBytesByAccount.get(account.id) ?? 0n) }))
-    .filter(({ availableBytes }) => availableBytes === null || availableBytes >= sizeBytes)
+  const candidates = fresh.map((account) => ({
+    account,
+    availableBytes: account.storageAccount?.availableBytes === null || account.storageAccount?.availableBytes === undefined ? null : account.storageAccount.availableBytes - (reservedBytesByAccount.get(account.id) ?? 0n),
+  }))
+  const fits = ({ availableBytes }: (typeof candidates)[number]) => availableBytes === null || availableBytes >= sizeBytes
+  const eligible = candidates.filter(fits)
 
   if (eligible.length === 0) return null
 
+  // An explicit folder/account pin overrides the routing policy: the file must
+  // land where the folder lives (still subject to actually fitting).
   if (targetAccountId) {
-    const target = eligible.find(e => e.account.id === targetAccountId)
+    const target = eligible.find((candidate) => candidate.account.id === targetAccountId)
     return target?.account ?? null
   }
 
-  const policy = await prisma.uploadRoutingPolicy.upsert({ where: { userId }, create: { userId, mode: 'most_available', priorityAccountIds: [] }, update: {} })
-  const mode = (['most_available', 'round_robin', 'priority'].includes(policy.mode) ? policy.mode : 'most_available') as RoutingMode
-  const priorityAccountIds = normalizePriorityAccountIds(policy.priorityAccountIds)
+  const policy = await prisma.uploadRoutingPolicy.upsert({
+    where: { userId },
+    create: { userId, mode: 'auto', priorityAccountIds: [], safetyCapPercent: DEFAULT_SAFETY_CAP_PERCENT },
+    update: {},
+  })
+  const mode = normalizeRoutingMode(policy.mode)
+  const priorityOrder = normalizePriorityAccountIds(policy.priorityAccountIds)
+  const safetyCapPercent = clampSafetyCap(policy.safetyCapPercent)
+  const typeRules = parseTypeRules(policy.typeRules)
 
-  if (mode === 'priority') return byPriority(eligible, priorityAccountIds)[0]?.account ?? null
-
-  if (mode === 'round_robin') {
-    const ordered = byPriority(eligible, priorityAccountIds)
-    const selected = ordered[policy.roundRobinCursor % ordered.length]?.account ?? ordered[0]?.account ?? null
-    await prisma.uploadRoutingPolicy.update({ where: { userId }, data: { roundRobinCursor: policy.roundRobinCursor + 1 } })
-    return selected
+  // Account Safety Guard: usage percent of a drive including bytes already
+  // reserved by concurrent uploads in this request. A null/zero total (S3
+  // without a known quota, or an account that never synced) is never capped.
+  const usagePercent = (candidate: (typeof eligible)[number]): number | null => {
+    const total = candidate.account.storageAccount?.totalBytes
+    if (total === null || total === undefined || total <= 0n) return null
+    const reserved = reservedBytesByAccount.get(candidate.account.id) ?? 0n
+    const used = (candidate.account.storageAccount?.usedBytes ?? 0n) + reserved
+    return Number((used * 1000n) / total) / 10
+  }
+  const underSafetyCap = (candidate: (typeof eligible)[number]) => {
+    const percent = usagePercent(candidate)
+    return percent === null || percent < safetyCapPercent
   }
 
-  return eligible
-    .sort((a, b) => {
+  const pickMostFree = (list: typeof eligible) =>
+    [...list].sort((a, b) => {
       if (a.availableBytes === null && b.availableBytes === null) return a.account.provider === 's3' ? -1 : 1
       if (a.availableBytes === null) return a.account.provider === 's3' ? -1 : 1
       if (b.availableBytes === null) return b.account.provider === 's3' ? 1 : -1
       return Number(b.availableBytes - a.availableBytes)
-    })[0]?.account
+    })[0]?.account ?? null
+
+  // Smart Auto: largest free headroom among drives below the safety cap. When
+  // every fitting drive is at/over the cap, fall back to the drive with the
+  // most free bytes so the guard alone never hard-fails an upload.
+  const chooseAuto = () => {
+    const safe = eligible.filter(underSafetyCap)
+    return pickMostFree(safe.length > 0 ? safe : eligible)
+  }
+
+  if (mode === 'priority') {
+    // Priority Waterfall: first account in the stored order that fits the file
+    // AND is below the safety cap; when the whole waterfall is capped, fall
+    // back to Smart Auto instead of choking a drive.
+    const firstSafe = byPriority(eligible, priorityOrder).find(underSafetyCap)
+    if (firstSafe) return firstSafe.account
+    return chooseAuto()
+  }
+
+  if (mode === 'rules') {
+    // Rule-Based: video/* -> assigned video pool, everything else -> primary
+    // pool. A missing/full/capped target falls back to Smart Auto.
+    const isVideo = typeof mimeType === 'string' && mimeType.toLowerCase().startsWith('video/')
+    const targetId = isVideo ? (typeRules.video ?? typeRules.default) : (typeRules.default ?? typeRules.document)
+    if (targetId) {
+      const target = eligible.find((candidate) => candidate.account.id === targetId)
+      if (target && underSafetyCap(target)) return target.account
+    }
+    return chooseAuto()
+  }
+
+  return chooseAuto()
 }
 
 export async function handleUpload(req: AuthRequest, res: Response, next: NextFunction) {
@@ -137,9 +223,24 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
     const contentType = req.headers['content-type']
     if (!contentType?.includes('multipart/form-data')) return res.status(400).json({ code: 'UPLOAD_INVALID_CONTENT_TYPE', message: 'multipart/form-data required.' })
 
+    // Pre-flight: refuse the request before any stream is consumed when the user
+    // has no connected storage account — previously this fell through into upload
+    // planning and surfaced as an opaque backend failure.
+    const activeAccountCount = await prisma.connectedAccount.count({
+      where: { userId: req.user!.id, provider: { in: ['google_drive', 's3'] }, status: 'connected' },
+    })
+    if (activeAccountCount === 0) {
+      return res.status(400).json({
+        success: false,
+        code: 'NO_ACTIVE_STORAGE_ACCOUNT',
+        message: 'No active storage accounts found. Please connect a storage account first.',
+      })
+    }
+
     const busboy = Busboy({ headers: req.headers, limits: { files: 25, fileSize: env.MAX_UPLOAD_BYTES } })
     const fields: { sizeBytes?: bigint; fileName?: string; mimeType?: string; folderId?: string } = {}
     let batchMeta: UploadMeta[] | null = null
+    let metaParseFailed = false
     let responded = false
     let fileSeen = false
     const reservedBytesByAccount = new Map<string, bigint>()
@@ -235,7 +336,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           return
         }
 
-        const account = await selectAccount(req.user!.id, meta.sizeBytes, reservedBytesByAccount, targetAccountId)
+        const account = await selectAccount(req.user!.id, meta.sizeBytes, reservedBytesByAccount, targetAccountId, meta.mimeType)
         if (!account) {
           fileStream.resume()
           failed.push({ fileName, code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space for this upload.' })
@@ -260,6 +361,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         let s3FileId: string | null = null
         let uploadedName = fileName
         let uploadedMimeType = meta.mimeType
+        let uploadedThumbnailUrl: string | null = null
         if (account.provider === 's3') {
           const config = await getS3ConfigForAccount(account.id, req.user!.id)
           const provisionalFile = await prisma.file.create({
@@ -286,11 +388,12 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           const uploaded = await drive.files.create({
             requestBody: { name: fileName, parents: [targetParentId] },
             media: { mimeType: meta.mimeType, body: Readable.from(fileBuffer) },
-            fields: 'id,name,mimeType,size',
+            fields: 'id,name,mimeType,size,thumbnailLink',
           })
           providerFileId = uploaded.data.id ?? ''
           uploadedName = uploaded.data.name ?? fileName
           uploadedMimeType = uploaded.data.mimeType ?? meta.mimeType
+          uploadedThumbnailUrl = uploaded.data.thumbnailLink ?? null
           logUpload('google upload completed', { sessionId: session.id, accountId: account.id, fileName })
 
           // Make the file public (anyone with link can edit/download)
@@ -315,7 +418,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
           return
         }
 
-        const file = account.provider === 's3' ? null : await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'google_drive', providerFileId, name: uploadedName, mimeType: uploadedMimeType, sizeBytes: meta.sizeBytes } })
+        const file = account.provider === 's3' ? null : await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'google_drive', providerFileId, name: uploadedName, mimeType: uploadedMimeType, sizeBytes: meta.sizeBytes, thumbnailUrl: uploadedThumbnailUrl } })
         if (file) {
           logUpload('database file created', { sessionId: session.id, fileId: file.id, accountId: account.id })
           completed.push({ ...file, sizeBytes: file.sizeBytes.toString() })
@@ -332,16 +435,37 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
     }
 
     busboy.on('field', (name, value) => {
-      if (name === 'sizeBytes') fields.sizeBytes = BigInt(value)
-      if (name === 'fileName') fields.fileName = value
-      if (name === 'mimeType') fields.mimeType = value
-      if (name === 'folderId') fields.folderId = value
-      if (name === 'filesMeta') batchMeta = parseBatchMeta(value)
+      try {
+        if (name === 'sizeBytes') fields.sizeBytes = BigInt(value)
+        if (name === 'fileName') fields.fileName = value
+        if (name === 'mimeType') fields.mimeType = value
+        if (name === 'folderId') fields.folderId = value
+        if (name === 'filesMeta') batchMeta = parseBatchMeta(value)
+      } catch (error) {
+        // Malformed metadata must produce a clean 400 — never an uncaught throw
+        // inside a stream handler (which would kill the connection mid-upload).
+        metaParseFailed = true
+        logUpload('invalid upload metadata field', { field: name, message: error instanceof Error ? error.message : 'Unknown error' })
+      }
     })
 
     busboy.on('file', (name, fileStream, info) => {
       fileSeen = true
-      pendingUploads.push(uploadOne(name, fileStream, info))
+      // A stream-level 'error' event with no listener crashes the process; log it
+      // so the response can fail gracefully instead of dropping the socket.
+      fileStream.on('error', (error) => {
+        logUpload('file stream error', { fileName: info.filename, message: error instanceof Error ? error.message : 'Unknown stream error' })
+      })
+      // Catch uploadOne rejections the moment they happen: a rejection left
+      // unhandled until busboy 'finish' triggers Node's unhandledRejection
+      // default (process exit) and the browser reports NetworkError.
+      pendingUploads.push(
+        uploadOne(name, fileStream, info).catch((error) => {
+          logUpload('file upload threw', { fileName: info.filename, message: error instanceof Error ? error.message : 'Upload failed' })
+          failed.push({ fileName: info.filename, code: 'UPLOAD_FAILED', message: error instanceof Error ? error.message : 'Upload failed' })
+          fileStream.resume()
+        }),
+      )
     })
 
     busboy.on('error', (error) => {
@@ -353,6 +477,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
     })
 
     busboy.on('finish', () => {
+      if (!responded && metaParseFailed) return fail(400, 'UPLOAD_META_INVALID', 'Upload metadata must be valid JSON with numeric sizes.')
       if (!responded && !fileSeen) return fail(400, 'UPLOAD_FILE_REQUIRED', 'file field required.')
       Promise.all(pendingUploads).then(() => {
         if (responded) return
@@ -399,7 +524,7 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
       }
     }
 
-    const account = await selectAccount(req.user!.id, sizeBytes, undefined, targetAccountId)
+    const account = await selectAccount(req.user!.id, sizeBytes, undefined, targetAccountId, body.mimeType)
     if (!account) return res.status(400).json({ code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space.' })
 
     if (account.provider !== 'google_drive') {
@@ -522,6 +647,10 @@ uploadRouter.get('/resumable/status/:id', requireAuth, async (req: AuthRequest, 
 
 // 3. Upload chunk
 uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, res, next) => {
+  // Declared before try so the catch can detect a client disconnect that aborts
+  // the downstream Google fetch (undici throws `TypeError: terminated`).
+  let clientAborted = false
+  const abortController = new AbortController()
   try {
     const session = await prisma.uploadSession.findFirstOrThrow({
       where: { id: String(req.params.id), userId: req.user!.id }
@@ -551,6 +680,17 @@ uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, r
     const drive = google.drive({ version: 'v3', auth })
     const token = await auth.getAccessToken()
 
+    // Track client disconnects so an aborted upload releases cleanly instead of
+    // throwing undici's `TypeError: terminated` (which currently surfaces as an
+    // uncaught error stack). When the browser cancels mid-PUT, `req` emits
+    // 'aborted'/'close' and the downstream Google fetch is aborted.
+    const onClientAbort = () => {
+      clientAborted = true
+      abortController.abort()
+    }
+    req.once('aborted', onClientAbort)
+    req.once('close', () => { if (!res.writableEnded) onClientAbort() })
+
     // Stream chunk body from client to Google Drive resumable URI
     const putHeaders = new Headers()
     putHeaders.set('Authorization', `Bearer ${token.token}`)
@@ -561,8 +701,12 @@ uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, r
       method: 'PUT',
       headers: putHeaders,
       body: req as any,
+      signal: abortController.signal,
       duplex: 'half'
     } as any)
+
+    // If the client went away, the response is already gone — release quietly.
+    if (clientAborted || res.writableEnded || res.destroyed) return
 
     if (putRes.status === 308) {
       return res.json({ status: 'uploading', offset: (endByte + 1n).toString() })
@@ -616,14 +760,25 @@ uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, r
       return res.status(201).json({ status: 'completed', file: { ...existingFile, sizeBytes: existingFile.sizeBytes.toString() } })
     }
 
-    const errorMsg = await putRes.text()
+    const rawError = await putRes.text()
+    // Google answers with JSON { error: { message } } — surface the human
+    // message so the frontend drawer shows a clean error instead of raw JSON.
+    let errorMsg = rawError
+    try {
+      const parsed = JSON.parse(rawError) as { error?: { message?: string }; message?: string }
+      errorMsg = parsed?.error?.message || parsed?.message || rawError
+    } catch { /* non-JSON body (proxy/HTML) — keep the raw text */ }
     await prisma.uploadSession.update({
       where: { id: session.id },
       data: { status: 'failed', errorMessage: errorMsg }
     })
 
-    return res.status(putRes.status).json({ code: 'UPLOAD_FAILED', message: errorMsg })
+    return res.status(putRes.status).json({ code: 'UPLOAD_FAILED', message: errorMsg || `Google Drive upload failed (HTTP ${putRes.status}).` })
   } catch (error) {
+    // Client disconnect surfaces as undici `TypeError: terminated` / AbortError.
+    // The response is already gone, so do not forward to the error middleware
+    // (which would log an uncaught stack). Just release the socket.
+    if (clientAborted || isClientAbortError(error)) return
     return next(error)
   }
 })

@@ -25,11 +25,17 @@ app.use(cors({
   origin: env.FRONTEND_URL,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'X-Request-Id'],
+  // Content-Range/Content-Length must be allowed: resumable chunk uploads use
+  // PUT with a Content-Range header, and a missing entry makes the browser
+  // reject the preflight (the actual PUT never reaches the server).
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With', 'X-Request-Id', 'Content-Range', 'Content-Length'],
 }))
 
-// JSON body parsing must run before any route handler.
-app.use(express.json({ limit: '1mb' }))
+// JSON body parsing must run before any route handler. Large limits keep
+// metadata-heavy requests (manifests, batch payloads) from being rejected while
+// multipart file bytes stream through busboy separately.
+app.use(express.json({ limit: '100mb' }))
+app.use(express.urlencoded({ limit: '100mb', extended: true }))
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }))
 

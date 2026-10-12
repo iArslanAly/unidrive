@@ -18,7 +18,7 @@ MIT — see [LICENSE](LICENSE).
 - **Storage pools UI** — combined quota tracking, per-account sync, and quota-driven upload routing.
 - **Virtual folders, sharing, invites** — nested folders, public share links (hashed tokens), and per-user file/folder invites.
 - **External upload API** — API keys with one-time secret display, hashed storage, and last-used tracking (`POST /api/v1/uploads`).
-- **Vault manifest page, activity logs, trash, starred & recents** views.
+- **Vault manifest verification, recycle bin, starred & recent files views.**
 
 ## Quick Start
 
@@ -38,8 +38,8 @@ cp backend/.env.example backend/.env
 # 3. Configure the frontend
 cp frontend/.env.example frontend/.env
 
-# 4. Initialize the database
-cd backend && npm run prisma:migrate && cd ..
+# 4. Initialize the SQLite database
+cd backend && npx prisma db push && cd ..
 
 # 5. (Optional) Seed your Google OAuth config
 cd backend && npm run seed:google-config && cd ..
@@ -60,17 +60,18 @@ npm run build   # builds backend (tsc) then frontend (vite build)
 npm run start --prefix backend   # run compiled backend from dist/
 ```
 
-
 ## Google Cloud Setup
 
-1. Create a project at https://console.cloud.google.com and enable the **Google Drive API**.
+1. Create a project at <https://console.cloud.google.com> and enable the **Google Drive API**.
 2. Configure the OAuth consent screen; add your Google account as a test user (or publish the app).
 3. Create an **OAuth 2.0 Client ID** (Web application) with redirect URI:
    `http://localhost:45450/api/connected-accounts/google/callback`
 4. Put the client ID/secret in `backend/.env` (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`) and run:
+
    ```bash
    cd backend && npm run seed:google-config
    ```
+
    Alternatively, set the Google OAuth config from the **Settings** page in the UI (stored encrypted in the DB).
 5. Sign in with Google from the app — your first Drive account connects automatically.
 
@@ -105,4 +106,4 @@ All routes are prefixed with `/api`. Authenticated routes expect `Authorization:
 
 ## Attribution / Credits
 
-UniDrive was initially inspired by and refactored from early **9drive** concepts into a local-first, chunk-pooled storage architecture.
+UniDrive was initially inspired by and refactored from early [9drive](https://github.com/zenhosta/9drive) concepts into a local-first, chunk-pooled storage architecture.
